@@ -22,6 +22,7 @@ namespace StereoCalibration
         private const float squareSize = 9f; // Размер квадрата на доске в мм
 
         private System.Windows.Forms.Button StartButton;
+        private System.Windows.Forms.Button OpenImagesButton;
         private System.Windows.Forms.Button CapturePairButton;
         private System.Windows.Forms.Button StereoCalibrateButton;
         private System.Windows.Forms.PictureBox pictureBox1;
@@ -45,6 +46,8 @@ namespace StereoCalibration
             StartButton = new Button();
             CapturePairButton = new Button();
             StereoCalibrateButton = new Button();
+            OpenImagesButton = new Button();
+
 
             pictureBox1 = new PictureBox();
             pictureBox2 = new PictureBox();
@@ -53,11 +56,14 @@ namespace StereoCalibration
             pictureBox2a = new PictureBox();
 
             StartButton.Text = "Начать";
-            CapturePairButton.Text = "Сохранить пару";
-            StereoCalibrateButton.Text = "Стереокалибровка";
+            CapturePairButton.Text = "Снимок";
+            StereoCalibrateButton.Text = "Калибр";
+            OpenImagesButton.Text = "Хранилище";
 
             StartButton.Location = new System.Drawing.Point(10, 10);
             StartButton.Size = new System.Drawing.Size(100, 30);
+            OpenImagesButton.Location = new System.Drawing.Point(340, 10); 
+            OpenImagesButton.Size = new System.Drawing.Size(150, 30);
             CapturePairButton.Location = new System.Drawing.Point(120, 10);
             CapturePairButton.Size = new System.Drawing.Size(100, 30);
             StereoCalibrateButton.Location = new System.Drawing.Point(230, 10);
@@ -78,10 +84,12 @@ namespace StereoCalibration
             Controls.Add(StereoCalibrateButton);
             Controls.Add(pictureBox1);
             Controls.Add(pictureBox2);
+            Controls.Add(OpenImagesButton);
 
             StartButton.Click += StartButton_Click;
             CapturePairButton.Click += CapturePairButton_Click;
             StereoCalibrateButton.Click += StereoCalibrateButton_Click;
+            OpenImagesButton.Click += OpenImagesButton_Click;
 
             this.ClientSize = new System.Drawing.Size(1310, 1040);
             this.Text = "Stereo Calibration";
@@ -102,8 +110,8 @@ namespace StereoCalibration
 
         private void InitializeCamera()
         {
-            capture1 = new VideoCapture(0); // Первая камера
-            capture2 = new VideoCapture(1); // Вторая камера
+            capture1 = new VideoCapture(1); // Первая камера
+            capture2 = new VideoCapture(2); // Вторая камера
             if (!capture1.IsOpened())
             {
                 MessageBox.Show("Не удалось открыть камеру 1 (индекс 1). Проверьте подключение или индекс.");
@@ -124,6 +132,30 @@ namespace StereoCalibration
             Directory.CreateDirectory("cam2\\" + cur_folder + "\\");
         }
 
+        private void OpenImagesButton_Click(object sender, EventArgs e)
+        {
+            // Открытие папки cam1
+            string cam1Path = Path.GetFullPath("cam1\\" + cur_folder);
+            if (Directory.Exists(cam1Path))
+            {
+                System.Diagnostics.Process.Start("explorer.exe", cam1Path);
+            }
+            else
+            {
+                MessageBox.Show("Папка с изображениями для камеры 1 не найдена.");
+            }
+
+            // Открытие папки cam2
+            string cam2Path = Path.GetFullPath("cam2\\" + cur_folder);
+            if (Directory.Exists(cam2Path))
+            {
+                System.Diagnostics.Process.Start("explorer.exe", cam2Path);
+            }
+            else
+            {
+                MessageBox.Show("Папка с изображениями для камеры 2 не найдена.");
+            }
+        }
         private void StartButton_Click(object sender, EventArgs e)
         {
             if (!isRunning)
@@ -142,15 +174,22 @@ namespace StereoCalibration
 
         private void ProcessFrame(object sender, EventArgs e)
         {
-            capture1.Retrieve(frame1);
-            capture2.Retrieve(frame2);
-
-            if (frame1 != null && frame2 != null)
+            // Проверка, открыты ли камеры
+            if (!capture1.IsOpened() || !capture2.IsOpened())
             {
-                var fr1 = new Mat();
-                var fr2 = new Mat();
-                fr1 = frame1.Clone();
-                fr2 = frame2.Clone();
+                MessageBox.Show("Одна из камер не открыта! Проверьте подключение.");
+                return;
+            }
+
+            // Получение кадров с камер
+            bool frame1Captured = capture1.Read(frame1);
+            bool frame2Captured = capture2.Read(frame2);
+
+            // Проверка, были ли кадры успешно захвачены и не пусты
+            if (frame1Captured && !frame1.Empty() && frame2Captured && !frame2.Empty())
+            {
+                var fr1 = frame1.Clone();
+                var fr2 = frame2.Clone();
                 Point2f[] corners1, corners2;
                 bool found1 = Cv2.FindChessboardCorners(frame1, patternSize, out corners1, ChessboardFlags.FastCheck);
                 bool found2 = Cv2.FindChessboardCorners(frame2, patternSize, out corners2, ChessboardFlags.FastCheck);
@@ -162,9 +201,7 @@ namespace StereoCalibration
                         Cv2.CvtColor(frame1, gray1, ColorConversionCodes.BGR2GRAY);
                         Cv2.CornerSubPix(gray1, corners1, new OpenCvSharp.Size(11, 11), new OpenCvSharp.Size(-1, -1),
                             new TermCriteria(CriteriaTypes.Eps | CriteriaTypes.MaxIter, 30, 0.1));
-
                         Cv2.DrawChessboardCorners(fr1, patternSize, corners1, found1);
-
                     }
                 }
                 if (found2)
@@ -174,31 +211,28 @@ namespace StereoCalibration
                         Cv2.CvtColor(frame2, gray2, ColorConversionCodes.BGR2GRAY);
                         Cv2.CornerSubPix(gray2, corners2, new OpenCvSharp.Size(11, 11), new OpenCvSharp.Size(-1, -1),
                             new TermCriteria(CriteriaTypes.Eps | CriteriaTypes.MaxIter, 30, 0.1));
-
                         Cv2.DrawChessboardCorners(fr2, patternSize, corners2, found2);
                     }
                 }
 
+                // Обновление pictureBox1
+                if (pictureBox1.InvokeRequired)
                 {
-                    if (pictureBox1.InvokeRequired)
-                    {
-                        pictureBox1.Invoke(new Action(() => pictureBox1.Image = BitmapConverter.ToBitmap(fr1)));
-                    }
-                    else
-                    {
-                        pictureBox1.Image = BitmapConverter.ToBitmap(fr1);
-                    }
+                    pictureBox1.Invoke(new Action(() => pictureBox1.Image = BitmapConverter.ToBitmap(fr1)));
+                }
+                else
+                {
+                    pictureBox1.Image = BitmapConverter.ToBitmap(fr1);
                 }
 
+                // Обновление pictureBox2
+                if (pictureBox2.InvokeRequired)
                 {
-                    if (pictureBox2.InvokeRequired)
-                    {
-                        pictureBox2.Invoke(new Action(() => pictureBox2.Image = BitmapConverter.ToBitmap(fr2)));
-                    }
-                    else
-                    {
-                        pictureBox2.Image = BitmapConverter.ToBitmap(fr2);
-                    }
+                    pictureBox2.Invoke(new Action(() => pictureBox2.Image = BitmapConverter.ToBitmap(fr2)));
+                }
+                else
+                {
+                    pictureBox2.Image = BitmapConverter.ToBitmap(fr2);
                 }
             }
             else
@@ -279,70 +313,73 @@ namespace StereoCalibration
             var mats1 = new List<Mat>();
             var mats2 = new List<Mat>();
 
+            // Получение списка файлов из директорий cam1 и cam2
             var names1 = Directory.GetFiles("cam1\\" + cur_folder);
             var names2 = Directory.GetFiles("cam2\\" + cur_folder);
 
+            // Проверка наличия достаточного количества файлов (требование: >= 10 пар и одинаковое количество)
+            if (names1.Length < 10 || names2.Length < 10 || names1.Length != names2.Length)
+            {
+                MessageBox.Show("В каждой папке должно быть не менее 10 изображений, и их количество должно совпадать!");
+                return;
+            }
+
+            // Загрузка изображений в списки Mat
             for (int i = 0; i < names1.Length; i++)
             {
                 mats1.Add(new Mat(names1[i]));
                 mats2.Add(new Mat(names2[i]));
             }
 
+            // Обработка изображений (поиск углов шахматной доски и заполнение списков точек)
             for (int j = 0; j < mats1.Count; j++)
             {
                 Point2f[] corners1, corners2;
-
-
                 bool found1 = Cv2.FindChessboardCorners(mats1[j], patternSize, out corners1, ChessboardFlags.FastCheck);
                 bool found2 = Cv2.FindChessboardCorners(mats2[j], patternSize, out corners2, ChessboardFlags.FastCheck);
-                using (Mat gray1 = new Mat())
-                using (Mat gray2 = new Mat())
+
+                if (found1 && found2)
                 {
-                    Cv2.CvtColor(mats1[j], gray1, ColorConversionCodes.BGR2GRAY);
-                    Cv2.CvtColor(mats2[j], gray2, ColorConversionCodes.BGR2GRAY);
-
-                    Cv2.CornerSubPix(gray1, corners1, new OpenCvSharp.Size(11, 11), new OpenCvSharp.Size(-1, -1),
-                        new TermCriteria(CriteriaTypes.Eps | CriteriaTypes.MaxIter, 30, 0.1));
-                    Cv2.CornerSubPix(gray2, corners2, new OpenCvSharp.Size(11, 11), new OpenCvSharp.Size(-1, -1),
-                        new TermCriteria(CriteriaTypes.Eps | CriteriaTypes.MaxIter, 30, 0.1));
-
-                    // Создание матриц с явным указанием типа и размера
-                    Mat imagePoints1 = new Mat(corners1.Length, 1, MatType.CV_32FC2);
-                    Mat imagePoints2 = new Mat(corners2.Length, 1, MatType.CV_32FC2);
-                    Point3f[] objPoints = GenerateObjectPoints().ToArray();
-                    Mat objectPoints = new Mat(objPoints.Length, 1, MatType.CV_32FC3);
-
-                    // Заполнение матриц данными
-                    for (int i = 0; i < corners1.Length; i++)
+                    using (Mat gray1 = new Mat())
+                    using (Mat gray2 = new Mat())
                     {
-                        imagePoints1.Set(i, 0, corners1[i]);
-                        imagePoints2.Set(i, 0, corners2[i]);
+                        Cv2.CvtColor(mats1[j], gray1, ColorConversionCodes.BGR2GRAY);
+                        Cv2.CvtColor(mats2[j], gray2, ColorConversionCodes.BGR2GRAY);
+
+                        Cv2.CornerSubPix(gray1, corners1, new OpenCvSharp.Size(11, 11), new OpenCvSharp.Size(-1, -1),
+                            new TermCriteria(CriteriaTypes.Eps | CriteriaTypes.MaxIter, 30, 0.1));
+                        Cv2.CornerSubPix(gray2, corners2, new OpenCvSharp.Size(11, 11), new OpenCvSharp.Size(-1, -1),
+                            new TermCriteria(CriteriaTypes.Eps | CriteriaTypes.MaxIter, 30, 0.1));
+
+                        // Создание матриц с явным указанием типа и размера
+                        Mat imagePoints1 = new Mat(corners1.Length, 1, MatType.CV_32FC2);
+                        Mat imagePoints2 = new Mat(corners2.Length, 1, MatType.CV_32FC2);
+                        Point3f[] objPoints = GenerateObjectPoints().ToArray();
+                        Mat objectPoints = new Mat(objPoints.Length, 1, MatType.CV_32FC3);
+
+                        // Заполнение матриц данными
+                        for (int i = 0; i < corners1.Length; i++)
+                        {
+                            imagePoints1.Set(i, 0, corners1[i]);
+                            imagePoints2.Set(i, 0, corners2[i]);
+                        }
+                        for (int i = 0; i < objPoints.Length; i++)
+                        {
+                            objectPoints.Set(i, 0, objPoints[i]);
+                        }
+
+                        pairImagePointsList1.Add(imagePoints1);
+                        pairImagePointsList2.Add(imagePoints2);
+                        pairObjectPointsList.Add(objectPoints);
                     }
-                    for (int i = 0; i < objPoints.Length; i++)
-                    {
-                        objectPoints.Set(i, 0, objPoints[i]);
-                    }
-
-                    Cv2.DrawChessboardCorners(gray1, patternSize, corners1, found1);
-                    Cv2.DrawChessboardCorners(gray2, patternSize, corners2, found2);
-                    Cv2.ImShow("asd", gray1);
-                    Cv2.ImShow("asd2", gray2);
-                    //Cv2.WaitKey();
-
-                    pairImagePointsList1.Add(imagePoints1);
-                    pairImagePointsList2.Add(imagePoints2);
-                    pairObjectPointsList.Add(objectPoints);
-
-
-
-
-                    // MessageBox.Show($"Парный снимок {pairImagePointsList1.Count} сохранен.");
                 }
             }
-            // Проверка количества снимков
-            if (pairObjectPointsList.Count != 10 && pairImagePointsList1.Count != 10 && pairImagePointsList2.Count != 10)
+
+            // Проверка количества собранных пар точек (требование: >= 10 и одинаковое количество в списках)
+            if (pairObjectPointsList.Count < 10 || pairImagePointsList1.Count < 10 || pairImagePointsList2.Count < 10 ||
+                pairObjectPointsList.Count != pairImagePointsList1.Count || pairObjectPointsList.Count != pairImagePointsList2.Count)
             {
-                MessageBox.Show("Нужно 10 снимков!");
+                MessageBox.Show("Нужно не менее 10 пар изображений с обнаруженной шахматной доской, и количество элементов в списках должно совпадать!");
                 return;
             }
             var ps_3d_all = new List<List<Point3f>>();
