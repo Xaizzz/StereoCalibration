@@ -179,6 +179,8 @@ namespace StereoCalibration
             }
         }
 
+        private int distancePrintCount = 0; 
+
         private void ProcessFrame(object sender, EventArgs e)
         {
             // Проверка, открыты ли камеры
@@ -241,26 +243,33 @@ namespace StereoCalibration
                 {
                     pictureBox2.Image = BitmapConverter.ToBitmap(fr2);
                 }
-                if (calibrationResult != null && found1 && found2){
-
-                    var t1 = new double[3];
-                    var v1 = new double[3];
-
-                    var t2 = new double[3];
-                    var v2 = new double[3];
-                    Cv2.SolvePnP(ps_3d_all_out, corners1, calibrationResult.CameraMatrix1, calibrationResult.DistCoeffs1, ref  t1, ref v1);
-                    Cv2.SolvePnP(ps_3d_all_out, corners2, calibrationResult.CameraMatrix2, calibrationResult.DistCoeffs2, ref t2, ref v2);
-                    var dt = new double[3];
-                    dt[0] = t1[0] - t2[0];
-                    dt[1] = t1[1] - t2[1];
-                    dt[2] = t1[2] - t2[2];
-                    Debug.WriteLine(dt[0] + " " + dt[1] + " " + dt[2] + " ");
-                }A
-                
+                if (calibrationResult != null && found1 && found2)
+                {
+                    double[] rvec1 = new double[3];
+                    double[] tvec1 = new double[3];
+                    double[] rvec2 = new double[3];
+                    double[] tvec2 = new double[3];
+                    Cv2.SolvePnP(ps_3d_all_out, corners1, calibrationResult.CameraMatrix1, calibrationResult.DistCoeffs1, ref rvec1, ref tvec1);
+                    Cv2.SolvePnP(ps_3d_all_out, corners2, calibrationResult.CameraMatrix2, calibrationResult.DistCoeffs2, ref rvec2, ref tvec2);
+                    double dt_x = tvec1[0] - tvec2[0];
+                    double dt_y = tvec1[1] - tvec2[1];
+                    double dt_z = tvec1[2] - tvec2[2];
+                    Debug.WriteLine($"XYZ {dt_x} {dt_y} {dt_z}");
+                }
             }
             else
             {
                 MessageBox.Show("Не удалось прочитать кадры с камер. Проверьте подключение.");
+            }
+
+            if (calibrationResult != null && distancePrintCount < 10)
+            {
+                Debug.WriteLine($"T: {calibrationResult.T[0]} {calibrationResult.T[1]} {calibrationResult.T[2]}");
+                double distance = Math.Sqrt(calibrationResult.T[0] * calibrationResult.T[0] +
+                                            calibrationResult.T[1] * calibrationResult.T[1] +
+                                            calibrationResult.T[2] * calibrationResult.T[2]);
+                Debug.WriteLine($"Расстояние между камерами: {distance} mm");
+                distancePrintCount++;
             }
         }
 
