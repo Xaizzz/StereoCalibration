@@ -35,11 +35,54 @@ namespace StereoCalibration
 
         CalibrationResult calibrationResult;
         List<Point3f>  ps_3d_all_out = new List<Point3f>();
+        private List<int> DetectCameras()
+        {
+            List<int> availableCameras = new List<int>();
+            for (int i = 0; i < 10; i++) // Проверка первых 10 индексов
+            {
+                using (var cap = new VideoCapture(i))
+                {
+                    if (cap.IsOpened())
+                    {
+                        availableCameras.Add(i);
+                        cap.Release();
+                    }
+                }
+            }
+            return availableCameras;
+        }
 
         public MainForm()
         {
             InitializeComponent();
-            InitializeCamera();
+
+            // Обнаружение доступных камер
+            var availableCameras = DetectCameras();
+            if (availableCameras.Count < 2)
+            {
+                MessageBox.Show("Недостаточно камер для работы. Требуется как минимум 2 камеры.");
+                this.Close();
+                return;
+            }
+
+            // Открываем окно для выбора камер
+            using (var selectionForm = new CameraSelectionForm(availableCameras))
+            {
+                if (selectionForm.ShowDialog() == DialogResult.OK)
+                {
+                    int cam1Index = availableCameras[selectionForm.Camera1Index];
+                    int cam2Index = availableCameras[selectionForm.Camera2Index];
+                    InitializeCamera(cam1Index, cam2Index); // Инициализация с выбранными индексами
+                }
+                else
+                {
+                    MessageBox.Show("Не выбраны камеры. Приложение будет закрыто.");
+                    this.Close();
+                    return;
+                }
+            }
+
+            // Инициализация списков и флагов
             pairImagePointsList1 = new List<Mat>();
             pairImagePointsList2 = new List<Mat>();
             pairObjectPointsList = new List<Mat>();
@@ -113,19 +156,19 @@ namespace StereoCalibration
             return points;
         }
 
-        private void InitializeCamera()
+        private void InitializeCamera(int cam1Index, int cam2Index)
         {
             Debug.WriteLine("init start");
-            capture1 = new VideoCapture(0); // Первая камера
-            capture2 = new VideoCapture(2); // Вторая камера
+            capture1 = new VideoCapture(cam1Index);
+            capture2 = new VideoCapture(cam2Index);
             if (!capture1.IsOpened())
             {
-                MessageBox.Show("Не удалось открыть камеру 1 (индекс 1). Проверьте подключение или индекс.");
+                MessageBox.Show($"Не удалось открыть камеру 1 (индекс {cam1Index}).");
                 return;
             }
             if (!capture2.IsOpened())
             {
-                MessageBox.Show("Не удалось открыть камеру 2 (индекс 2). Проверьте подключение или индекс.");
+                MessageBox.Show($"Не удалось открыть камеру 2 (индекс {cam2Index}).");
                 return;
             }
             Debug.WriteLine("init end");
@@ -254,7 +297,7 @@ namespace StereoCalibration
                     double dt_x = tvec1[0] - tvec2[0];
                     double dt_y = tvec1[1] - tvec2[1];
                     double dt_z = tvec1[2] - tvec2[2];
-                    Debug.WriteLine($"XYZ {dt_x} {dt_y} {dt_z}");
+                    Debug.WriteLine($"X {dt_x} Y {dt_y} Z {dt_z}");
                 }
             }
             else
