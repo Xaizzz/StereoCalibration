@@ -8,6 +8,7 @@ using System.Diagnostics;
 using System.IO;
 using OpenCvSharp.Internal.Vectors;
 using System.Data;
+using Newtonsoft.Json;
 
 namespace StereoCalibration
 {
@@ -31,6 +32,10 @@ namespace StereoCalibration
         private System.Windows.Forms.PictureBox pictureBox1a;
         private System.Windows.Forms.PictureBox pictureBox2a;
         string cur_folder = "0204_1a";
+
+        CalibrationResult calibrationResult;
+        List<Point3f>  ps_3d_all_out = new List<Point3f>();
+
         public MainForm()
         {
             InitializeComponent();
@@ -62,7 +67,7 @@ namespace StereoCalibration
 
             StartButton.Location = new System.Drawing.Point(10, 10);
             StartButton.Size = new System.Drawing.Size(100, 30);
-            OpenImagesButton.Location = new System.Drawing.Point(340, 10); 
+            OpenImagesButton.Location = new System.Drawing.Point(340, 10);
             OpenImagesButton.Size = new System.Drawing.Size(150, 30);
             CapturePairButton.Location = new System.Drawing.Point(120, 10);
             CapturePairButton.Size = new System.Drawing.Size(100, 30);
@@ -94,7 +99,7 @@ namespace StereoCalibration
             this.ClientSize = new System.Drawing.Size(1310, 1040);
             this.Text = "Stereo Calibration";
         }
-
+       
         private List<Point3f> GenerateObjectPoints()
         {
             List<Point3f> points = new List<Point3f>();
@@ -110,7 +115,8 @@ namespace StereoCalibration
 
         private void InitializeCamera()
         {
-            capture1 = new VideoCapture(1); // Первая камера
+            Debug.WriteLine("init start");
+            capture1 = new VideoCapture(0); // Первая камера
             capture2 = new VideoCapture(2); // Вторая камера
             if (!capture1.IsOpened())
             {
@@ -122,6 +128,7 @@ namespace StereoCalibration
                 MessageBox.Show("Не удалось открыть камеру 2 (индекс 2). Проверьте подключение или индекс.");
                 return;
             }
+            Debug.WriteLine("init end");
             capture1.Set(VideoCaptureProperties.FrameWidth, 640);
             capture1.Set(VideoCaptureProperties.FrameHeight, 480);
             capture2.Set(VideoCaptureProperties.FrameWidth, 640);
@@ -234,6 +241,22 @@ namespace StereoCalibration
                 {
                     pictureBox2.Image = BitmapConverter.ToBitmap(fr2);
                 }
+                if (calibrationResult != null && found1 && found2){
+
+                    var t1 = new double[3];
+                    var v1 = new double[3];
+
+                    var t2 = new double[3];
+                    var v2 = new double[3];
+                    Cv2.SolvePnP(ps_3d_all_out, corners1, calibrationResult.CameraMatrix1, calibrationResult.DistCoeffs1, ref  t1, ref v1);
+                    Cv2.SolvePnP(ps_3d_all_out, corners2, calibrationResult.CameraMatrix2, calibrationResult.DistCoeffs2, ref t2, ref v2);
+                    var dt = new double[3];
+                    dt[0] = t1[0] - t2[0];
+                    dt[1] = t1[1] - t2[1];
+                    dt[2] = t1[2] - t2[2];
+                    Debug.WriteLine(dt[0] + " " + dt[1] + " " + dt[2] + " ");
+                }A
+                
             }
             else
             {
@@ -251,6 +274,7 @@ namespace StereoCalibration
 
             Mat snapshot1 = frame1.Clone();
             Mat snapshot2 = frame2.Clone();
+            
 
 
 
@@ -304,6 +328,38 @@ namespace StereoCalibration
             }
         }
 
+        private double[,] MatToArray(Mat mat)
+        {
+            if (mat.Rows != 3 || mat.Cols != 3)
+                throw new ArgumentException("Mat должен быть размером 3x3");
+
+            double[,] array = new double[3, 3];
+            for (int i = 0; i < 3; i++)
+            {
+                for (int j = 0; j < 3; j++)
+                {
+                    array[i, j] = mat.At<double>(i, j);
+                }
+            }
+            return array;
+        }
+
+        private double[] MatToVector(Mat mat)
+        {
+            if (mat.Rows == 3 && mat.Cols == 1)
+            {
+                return new double[] { mat.At<double>(0, 0), mat.At<double>(1, 0), mat.At<double>(2, 0) };
+            }
+            else if (mat.Rows == 1 && mat.Cols == 3)
+            {
+                return new double[] { mat.At<double>(0, 0), mat.At<double>(0, 1), mat.At<double>(0, 2) };
+            }
+            else
+            {
+                throw new ArgumentException("Mat должен быть размером 3x1 или 1x3");
+            }
+        }
+
         private void StereoCalibrateButton_Click(object sender, EventArgs e)
         {
             pairImagePointsList1 = new List<Mat>();
@@ -317,21 +373,21 @@ namespace StereoCalibration
             var names1 = Directory.GetFiles("cam1\\" + cur_folder);
             var names2 = Directory.GetFiles("cam2\\" + cur_folder);
 
-            // Проверка наличия достаточного количества файлов (требование: >= 10 пар и одинаковое количество)
+            // Проверка наличия достаточного количества файлов
             if (names1.Length < 10 || names2.Length < 10 || names1.Length != names2.Length)
             {
-                MessageBox.Show("В каждой папке должно быть не менее 10 изображений, и их количество должно совпадать!");
+                Debug.WriteLine("В каждой папке должно быть не менее 10 изображений, и их количество должно совпадать!");
                 return;
             }
 
-            // Загрузка изображений в списки Mat
+            // Загрузка изображений
             for (int i = 0; i < names1.Length; i++)
             {
                 mats1.Add(new Mat(names1[i]));
                 mats2.Add(new Mat(names2[i]));
             }
 
-            // Обработка изображений (поиск углов шахматной доски и заполнение списков точек)
+            // Обработка изображений
             for (int j = 0; j < mats1.Count; j++)
             {
                 Point2f[] corners1, corners2;
@@ -351,13 +407,11 @@ namespace StereoCalibration
                         Cv2.CornerSubPix(gray2, corners2, new OpenCvSharp.Size(11, 11), new OpenCvSharp.Size(-1, -1),
                             new TermCriteria(CriteriaTypes.Eps | CriteriaTypes.MaxIter, 30, 0.1));
 
-                        // Создание матриц с явным указанием типа и размера
                         Mat imagePoints1 = new Mat(corners1.Length, 1, MatType.CV_32FC2);
                         Mat imagePoints2 = new Mat(corners2.Length, 1, MatType.CV_32FC2);
                         Point3f[] objPoints = GenerateObjectPoints().ToArray();
                         Mat objectPoints = new Mat(objPoints.Length, 1, MatType.CV_32FC3);
 
-                        // Заполнение матриц данными
                         for (int i = 0; i < corners1.Length; i++)
                         {
                             imagePoints1.Set(i, 0, corners1[i]);
@@ -369,57 +423,59 @@ namespace StereoCalibration
                         }
 
                         pairImagePointsList1.Add(imagePoints1);
-                        pairImagePointsList2.Add(imagePoints2);
+                        pairImagePointsList2.Add(imagePoints2);       
                         pairObjectPointsList.Add(objectPoints);
+                      /*  Cv2.CvtColor(gray1, gray1, ColorConversionCodes.GRAY2RGB);
+                        Cv2.CvtColor(gray2, gray2, ColorConversionCodes.GRAY2RGB);
+                        Cv2.DrawChessboardCorners(gray1, patternSize, corners1, found1);
+                        Cv2.DrawChessboardCorners(gray2, patternSize, corners2, found2);
+                        Cv2.ImShow("asfd1", gray1);
+                        Cv2.ImShow("asfd2", gray2);
+                        Cv2.WaitKey();*/
+                     
                     }
+                    
+              
                 }
             }
 
-            // Проверка количества собранных пар точек (требование: >= 10 и одинаковое количество в списках)
+            // Проверка количества пар
             if (pairObjectPointsList.Count < 10 || pairImagePointsList1.Count < 10 || pairImagePointsList2.Count < 10 ||
                 pairObjectPointsList.Count != pairImagePointsList1.Count || pairObjectPointsList.Count != pairImagePointsList2.Count)
             {
                 MessageBox.Show("Нужно не менее 10 пар изображений с обнаруженной шахматной доской, и количество элементов в списках должно совпадать!");
                 return;
             }
+
             var ps_3d_all = new List<List<Point3f>>();
             var ps_2d_all_1 = new List<List<Point2f>>();
             var ps_2d_all_2 = new List<List<Point2f>>();
-            // Вывод информации о точках
+
             for (int i = 0; i < pairObjectPointsList.Count; i++)
             {
                 var objMat = pairObjectPointsList[i];
                 var imgMat1 = pairImagePointsList1[i];
                 var imgMat2 = pairImagePointsList2[i];
-                Debug.WriteLine($"Снимок {i + 1}:");
-                Debug.WriteLine($"objectPoints: Type={objMat.Type()}, Rows={objMat.Rows}, Cols={objMat.Cols}");
-                Debug.WriteLine($"imagePoints1: Type={imgMat1.Type()}, Rows={imgMat1.Rows}, Cols={imgMat1.Cols}");
-                Debug.WriteLine($"imagePoints2: Type={imgMat2.Type()}, Rows={imgMat2.Rows}, Cols={imgMat2.Cols}");
                 var ps_3d = new List<Point3f>();
                 var ps_2d_1 = new List<Point2f>();
                 var ps_2d_2 = new List<Point2f>();
-                // Проверка первых трёх точек
+
                 for (int j = 0; j < objMat.Rows; j++)
                 {
-                    var objPt = objMat.Get<Vec3f>(j, 0); // 3D-точка
-
-                    var imgPt1 = imgMat1.Get<Vec2f>(j, 0); // 2D-точка камеры 1
-                    var imgPt2 = imgMat2.Get<Vec2f>(j, 0); // 2D-точка камеры 2
+                    var objPt = objMat.Get<Vec3f>(j, 0);
+                    var imgPt1 = imgMat1.Get<Vec2f>(j, 0);
+                    var imgPt2 = imgMat2.Get<Vec2f>(j, 0);
 
                     ps_3d.Add(new Point3f(objPt.Item0, objPt.Item1, objPt.Item2));
-
                     ps_2d_1.Add(new Point2f(imgPt1.Item0, imgPt1.Item1));
                     ps_2d_2.Add(new Point2f(imgPt2.Item0, imgPt2.Item1));
-
-                    //Debug.WriteLine($"  Точка {   j}: object=({objPt.Item0}, {objPt.Item1}, {objPt.Item2}), " +  $"img1=({imgPt1.Item0}, {imgPt1.Item1}), img2=({imgPt2.Item0}, {imgPt2.Item1})");
-
                 }
                 ps_3d_all.Add(ps_3d);
                 ps_2d_all_1.Add(ps_2d_1);
                 ps_2d_all_2.Add(ps_2d_2);
             }
-
-            // Выполнение стереокалибровки
+            ps_3d_all_out = ps_3d_all[0];
+            // Калибровка
             var cameraMatrix1 = new double[3, 3];
             var distCoeffs1 = new double[5];
             var cameraMatrix2 = new double[3, 3];
@@ -428,6 +484,7 @@ namespace StereoCalibration
             Mat T = new Mat();
             Mat E = new Mat();
             Mat F = new Mat();
+
             var tvecs1 = new Vec3d[10];
             var tvecs2 = new Vec3d[10];
             var rvecs1 = new Vec3d[10];
@@ -440,35 +497,51 @@ namespace StereoCalibration
 
              var distCoeffs1_double = (double[])to_double(distCoeffs1);
              var distCoeffs2_double = (double[])to_double(distCoeffs2);*/
-
-            var err1 = Cv2.CalibrateCamera(ps_3d_all, ps_2d_all_1, new OpenCvSharp.Size(640, 480), cameraMatrix1, distCoeffs1, out rvecs1, out tvecs1, CalibrationFlags.None, new TermCriteria(CriteriaTypes.Count, 100, 0.1));
-            var err2 = Cv2.CalibrateCamera(ps_3d_all, ps_2d_all_2, new OpenCvSharp.Size(640, 480), cameraMatrix2, distCoeffs2, out rvecs2, out tvecs2, CalibrationFlags.None, new TermCriteria(CriteriaTypes.Count, 100, 0.1));
+            var image_size = mats1[0].Size();
+            var err1 = Cv2.CalibrateCamera(ps_3d_all, ps_2d_all_1, image_size, cameraMatrix1, distCoeffs1, out rvecs1, out tvecs1, CalibrationFlags.None, new TermCriteria(CriteriaTypes.Count, 100, 0.1));
+            var err2 = Cv2.CalibrateCamera(ps_3d_all, ps_2d_all_2, image_size, cameraMatrix2, distCoeffs2, out rvecs2, out tvecs2, CalibrationFlags.None, new TermCriteria(CriteriaTypes.Count, 100, 0.1));
             print_double(cameraMatrix1);
             print_double(distCoeffs1);
             print_double(cameraMatrix2);
             print_double(distCoeffs2);
-            Console.WriteLine("errors" + err1 + " " + err2);
+            Debug.WriteLine("errors" + err1 + " " + err2);
 
-            //try
+
+
+            try
             {
                 double error = Cv2.StereoCalibrate(
                     ps_3d_all,
                     ps_2d_all_1,
                     ps_2d_all_2,
                     cameraMatrix1, distCoeffs1, cameraMatrix2, distCoeffs2,
-                     new OpenCvSharp.Size(640, 480), R, T, E, F,
+                    new OpenCvSharp.Size(640, 480), R, T, E, F,
                     CalibrationFlags.RationalModel
                 );
 
-                print_mat(R);
-                print_mat(T);
-                print_mat(E);
-                print_mat(F);
-                // MessageBox.Show($"Калибровка успешна! Ошибка: {error}");
+                // Преобразование Mat в массивы
+                var result = new CalibrationResult
+                {
+                    CameraMatrix1 = cameraMatrix1,
+                    DistCoeffs1 = distCoeffs1,
+                    CameraMatrix2 = cameraMatrix2,
+                    DistCoeffs2 = distCoeffs2,
+                    R = MatToArray(R),
+                    T = MatToVector(T),
+                    E = MatToArray(E),
+                    F = MatToArray(F),
+                    Error = error
+                };
+                calibrationResult = result;
+                // Сериализация в JSON и сохранение в файл
+                string json = JsonConvert.SerializeObject(result, Formatting.Indented);
+                File.WriteAllText("calibration_result.json", json);
+
+                MessageBox.Show($"Калибровка успешна! Ошибка: {error}\nРезультаты сохранены в calibration_result.json");
             }
-            //catch (OpenCvSharp.OpenCVException ex)
+            catch (OpenCvSharp.OpenCVException ex)
             {
-                // MessageBox.Show($"Ошибка стереокалибровки: {ex.Message}");
+                MessageBox.Show($"Ошибка стереокалибровки: {ex.Message}");
             }
         }
 
@@ -536,5 +609,18 @@ namespace StereoCalibration
 
 
         }
+    }
+
+    public class CalibrationResult
+    {
+        public double[,] CameraMatrix1 { get; set; } // Матрица камеры 1 (3x3)
+        public double[] DistCoeffs1 { get; set; }   // Коэффициенты искажения 1 (5)
+        public double[,] CameraMatrix2 { get; set; } // Матрица камеры 2 (3x3)
+        public double[] DistCoeffs2 { get; set; }   // Коэффициенты искажения 2 (5)
+        public double[,] R { get; set; }            // Матрица вращения (3x3)
+        public double[] T { get; set; }             // Вектор трансляции (3)
+        public double[,] E { get; set; }            // Существенная матрица (3x3)
+        public double[,] F { get; set; }            // Фундаментальная матрица (3x3)
+        public double Error { get; set; }           // Ошибка калибровки
     }
 }
