@@ -222,7 +222,7 @@ namespace StereoCalibration
             }
         }
 
-        private int distancePrintCount = 0; 
+        private int distancePrintCount = 0;
 
         private void ProcessFrame(object sender, EventArgs e)
         {
@@ -286,18 +286,185 @@ namespace StereoCalibration
                 {
                     pictureBox2.Image = BitmapConverter.ToBitmap(fr2);
                 }
+
                 if (calibrationResult != null && found1 && found2)
                 {
+                    // Преобразование данных в Mat для SolvePnP
+                    Mat objectPointsMat = new Mat(ps_3d_all_out.Count, 1, MatType.CV_32FC3);
+                    for (int i = 0; i < ps_3d_all_out.Count; i++)
+                    {
+                        objectPointsMat.Set(i, 0, ps_3d_all_out[i]);
+                    }
+
+                    Mat imagePoints1Mat = new Mat(corners1.Length, 1, MatType.CV_32FC2);
+                    for (int i = 0; i < corners1.Length; i++)
+                    {
+                        imagePoints1Mat.Set(i, 0, corners1[i]);
+                    }
+
+                    Mat imagePoints2Mat = new Mat(corners2.Length, 1, MatType.CV_32FC2);
+                    for (int i = 0; i < corners2.Length; i++)
+                    {
+                        imagePoints2Mat.Set(i, 0, corners2[i]);
+                    }
+
+                    Mat cameraMatrix1Mat = new Mat(3, 3, MatType.CV_64FC1);
+                    for (int i = 0; i < 3; i++)
+                    {
+                        for (int j = 0; j < 3; j++)
+                        {
+                            cameraMatrix1Mat.Set(i, j, calibrationResult.CameraMatrix1[i, j]);
+                        }
+                    }
+
+                    Mat cameraMatrix2Mat = new Mat(3, 3, MatType.CV_64FC1);
+                    for (int i = 0; i < 3; i++)
+                    {
+                        for (int j = 0; j < 3; j++)
+                        {
+                            cameraMatrix2Mat.Set(i, j, calibrationResult.CameraMatrix2[i, j]);
+                        }
+                    }
+
+                    Mat distCoeffs1Mat = new Mat(1, calibrationResult.DistCoeffs1.Length, MatType.CV_64FC1);
+                    for (int i = 0; i < calibrationResult.DistCoeffs1.Length; i++)
+                    {
+                        distCoeffs1Mat.Set(0, i, calibrationResult.DistCoeffs1[i]);
+                    }
+
+                    Mat distCoeffs2Mat = new Mat(1, calibrationResult.DistCoeffs2.Length, MatType.CV_64FC1);
+                    for (int i = 0; i < calibrationResult.DistCoeffs2.Length; i++)
+                    {
+                        distCoeffs2Mat.Set(0, i, calibrationResult.DistCoeffs2[i]);
+                    }
+
+                    // SolvePnP для обеих камер
                     double[] rvec1 = new double[3];
                     double[] tvec1 = new double[3];
                     double[] rvec2 = new double[3];
                     double[] tvec2 = new double[3];
-                    Cv2.SolvePnP(ps_3d_all_out, corners1, calibrationResult.CameraMatrix1, calibrationResult.DistCoeffs1, ref rvec1, ref tvec1);
-                    Cv2.SolvePnP(ps_3d_all_out, corners2, calibrationResult.CameraMatrix2, calibrationResult.DistCoeffs2, ref rvec2, ref tvec2);
-                    double dt_x = tvec1[0] - tvec2[0];
-                    double dt_y = tvec1[1] - tvec2[1];
-                    double dt_z = tvec1[2] - tvec2[2];
-                    Debug.WriteLine($"X {dt_x} Y {dt_y} Z {dt_z}");
+
+                    Mat rvec1Mat = new Mat(3, 1, MatType.CV_64FC1);
+                    Mat tvec1Mat = new Mat(3, 1, MatType.CV_64FC1);
+                    Mat rvec2Mat = new Mat(3, 1, MatType.CV_64FC1);
+                    Mat tvec2Mat = new Mat(3, 1, MatType.CV_64FC1);
+
+                    Cv2.SolvePnP(objectPointsMat, imagePoints1Mat, cameraMatrix1Mat, distCoeffs1Mat, rvec1Mat, tvec1Mat);
+                    Cv2.SolvePnP(objectPointsMat, imagePoints2Mat, cameraMatrix2Mat, distCoeffs2Mat, rvec2Mat, tvec2Mat);
+
+                    // Извлечение данных из Mat в double[]
+                    for (int i = 0; i < 3; i++)
+                    {
+                        rvec1[i] = rvec1Mat.At<double>(i, 0);
+                        tvec1[i] = tvec1Mat.At<double>(i, 0);
+                        rvec2[i] = rvec2Mat.At<double>(i, 0);
+                        tvec2[i] = tvec2Mat.At<double>(i, 0);
+                    }
+
+                    // Преобразование rvec в матрицы поворота
+                    Mat R1 = new Mat(3, 3, MatType.CV_64FC1);
+                    Cv2.Rodrigues(rvec1Mat, R1);
+                    Mat R2 = new Mat(3, 3, MatType.CV_64FC1);
+                    Cv2.Rodrigues(rvec2Mat, R2);
+
+                    // Вычисление относительного поворота
+                    Mat R_rel = R2 * R1.T();
+
+                    // Преобразование tvec1 и tvec2 в Mat для вычислений
+                    tvec1Mat = new Mat(3, 1, MatType.CV_64FC1);
+                    for (int i = 0; i < 3; i++)
+                    {
+                        tvec1Mat.Set(i, 0, tvec1[i]);
+                    }
+
+                    tvec2Mat = new Mat(3, 1, MatType.CV_64FC1);
+                    for (int i = 0; i < 3; i++)
+                    {
+                        tvec2Mat.Set(i, 0, tvec2[i]);
+                    }
+
+                    // Вычисление относительной трансляции
+                    Mat t_rel = tvec2Mat - R_rel * tvec1Mat;
+
+                    // Извлечение динамических значений положения камеры 2 относительно камеры 1
+                    double dynamic_cam_dx = t_rel.At<double>(0, 0);
+                    double dynamic_cam_dy = t_rel.At<double>(1, 0);
+                    double dynamic_cam_dz = t_rel.At<double>(2, 0);
+                    double dynamic_cam_distance = Math.Sqrt(dynamic_cam_dx * dynamic_cam_dx + dynamic_cam_dy * dynamic_cam_dy + dynamic_cam_dz * dynamic_cam_dz);
+
+                    // Вычисление положения камеры 1 относительно камеры 2
+                    Mat R_rel_inv = R_rel.T();
+                    Mat t_rel_inv = -R_rel_inv * t_rel;
+                    double dynamic_cam1_x = t_rel_inv.At<double>(0, 0);
+                    double dynamic_cam1_y = t_rel_inv.At<double>(1, 0);
+                    double dynamic_cam1_z = t_rel_inv.At<double>(2, 0);
+
+                    // Вывод динамических данных
+                    Debug.WriteLine($"Динамическое положение камеры 2 относительно камеры 1 (мм): X {dynamic_cam_dx:F2}, Y {dynamic_cam_dy:F2}, Z {dynamic_cam_dz:F2}");
+                    Debug.WriteLine($"Динамическое положение камеры 1 относительно камеры 2 (мм): X {dynamic_cam1_x:F2}, Y {dynamic_cam1_y:F2}, Z {dynamic_cam1_z:F2}");
+                    Debug.WriteLine($"Динамическое расстояние между камерами: {dynamic_cam_distance:F2} мм");
+                    
+                    // Опционально: сравнение с статическим T для оценки стабильности
+                    Mat T_static = new Mat(3, 1, MatType.CV_64FC1);
+                    for (int i = 0; i < 3; i++)
+                    {
+                        T_static.Set(i, 0, calibrationResult.T[i]);
+                    }
+                    Mat diff = t_rel - T_static;
+                    double diff_x = diff.At<double>(0, 0);
+                    double diff_y = diff.At<double>(1, 0);
+                    double diff_z = diff.At<double>(2, 0);
+                    double diff_norm = Math.Sqrt(diff_x * diff_x + diff_y * diff_y + diff_z * diff_z);
+                    Debug.WriteLine($"Разница между динамическим и статическим T: X {diff_x:F2}, Y {diff_y:F2}, Z {diff_z:F2}, Общая: {diff_norm:F2} мм");
+
+                    // Преобразование R в Mat (предполагается, что calibrationResult.R - это double[,])
+                    Mat R = new Mat(3, 3, MatType.CV_64FC1);
+                    for (int i = 0; i < 3; i++)
+                    {
+                        for (int j = 0; j < 3; j++)
+                        {
+                            R.Set(i, j, calibrationResult.R[i, j]);
+                        }
+                    }
+
+                    // Преобразование T в Mat (предполагается, что calibrationResult.T - это double[])
+                    Mat T = new Mat(3, 1, MatType.CV_64FC1);
+                    for (int i = 0; i < 3; i++)
+                    {
+                        T.Set(i, 0, calibrationResult.T[i]);
+                    }
+
+                    // Преобразование tvec2 в систему координат камеры 1: R * tvec2 + T
+                    Mat tvec2_transformed = R.T() * (tvec2Mat - T);
+
+                    // Вычисление разницы для проверки калибровки
+                    Mat difference = tvec1Mat - tvec2_transformed;
+                    double dx = difference.At<double>(0, 0);
+                    double dy = difference.At<double>(1, 0);
+                    double dz = difference.At<double>(2, 0);
+                    double error = Math.Sqrt(dx * dx + dy * dy + dz * dz);
+
+                    // Вывод положения камеры 2 относительно камеры 1 из T
+                    double cam_dx = calibrationResult.T[0];
+                    double cam_dy = calibrationResult.T[1];
+                    double cam_dz = calibrationResult.T[2];
+                    double cam_distance = Math.Sqrt(cam_dx * cam_dx + cam_dy * cam_dy + cam_dz * cam_dz);
+
+                    // Вывод положения камеры 1 относительно камеры 2 (в системе камеры 2)
+                    double cam1_x = -calibrationResult.T[0];
+                    double cam1_y = -calibrationResult.T[1];
+                    double cam1_z = -calibrationResult.T[2];
+                    
+                    Debug.WriteLine($"Положение камеры 2 относительно камеры 1 (мм): X {cam_dx:F2}, Y {cam_dy:F2}, Z {cam_dz:F2}");
+                    Debug.WriteLine($"Положение камеры 1 относительно камеры 2 (мм): X {cam1_x:F2}, Y {cam1_y:F2}, Z {cam1_z:F2}");
+                    Debug.WriteLine($"Расстояние между камерами: {cam_distance:F2} мм");
+                   
+                    Debug.WriteLine("Кадр с камеры 1 обновлен: " + frame1.GetHashCode());
+                    Debug.WriteLine("Кадр с камеры 2 обновлен: " + frame2.GetHashCode());
+                    Debug.WriteLine($"tvec1: X {tvec1[0]:F2}, Y {tvec1[1]:F2}, Z {tvec1[2]:F2}");
+                    Debug.WriteLine($"tvec2: X {tvec2[0]:F2}, Y {tvec2[1]:F2}, Z {tvec2[2]:F2}");
+                    
+                    Debug.WriteLine($"Ошибка калибровки (мм): X {dx:F2}, Y {dy:F2}, Z {dz:F2}, Общая: {error:F2}");
                 }
             }
             else
@@ -315,7 +482,6 @@ namespace StereoCalibration
                 distancePrintCount++;
             }
         }
-
         private void CapturePairButton_Click(object sender, EventArgs e)
         {
             if (!isRunning)
@@ -557,9 +723,13 @@ namespace StereoCalibration
             print_double(cameraMatrix2);
             print_double(distCoeffs2);
             Debug.WriteLine("errors" + err1 + " " + err2);
-
-
-
+            var image_size_opt = mats1[0].Size();
+            var rect_roi1 = new Rect();
+            var rect_roi2 = new Rect();
+            Cv2.GetOptimalNewCameraMatrix(cameraMatrix1, distCoeffs1, image_size, 1, image_size_opt, out rect_roi1);
+            Cv2.GetOptimalNewCameraMatrix(cameraMatrix2, distCoeffs2, image_size, 1, image_size_opt, out rect_roi2);
+            Debug.WriteLine("rect_roi1"+rect_roi1.Width+ " " + rect_roi1.Height);
+            Debug.WriteLine("rect_roi2" + rect_roi2.Width + " " + rect_roi2.Height);
             try
             {
                 double error = Cv2.StereoCalibrate(
