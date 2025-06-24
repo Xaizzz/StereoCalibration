@@ -9,6 +9,7 @@ using System.IO;
 using OpenCvSharp.Internal.Vectors;
 using System.Data;
 using Newtonsoft.Json;
+using OpenCvSharp.Aruco;
 
 namespace StereoCalibration
 {
@@ -20,7 +21,7 @@ namespace StereoCalibration
         private List<Mat> pairImagePointsList1, pairImagePointsList2;
         private List<Mat> pairObjectPointsList;
         private OpenCvSharp.Size patternSize = new OpenCvSharp.Size(9, 6); // Размер шахматной доски (10x7)
-        private const float squareSize = 9f; // Размер квадрата на доске в мм
+        private const float squareSize = 8f; // Размер квадрата на доске в мм
 
         private System.Windows.Forms.Button StartButton;
         private System.Windows.Forms.Button OpenImagesButton;
@@ -34,7 +35,7 @@ namespace StereoCalibration
         string cur_folder = "0204_1a";
 
         CalibrationResult calibrationResult;
-        List<Point3f>  ps_3d_all_out = new List<Point3f>();
+        List<Point3f> ps_3d_all_out = new List<Point3f>();
         private List<int> DetectCameras()
         {
             List<int> availableCameras = new List<int>();
@@ -52,10 +53,23 @@ namespace StereoCalibration
             return availableCameras;
         }
 
+        private Dictionary dictionary;
+        private DetectorParameters detectorParameters;
+
         public MainForm()
         {
             InitializeComponent();
 
+            // Инициализация ArUco детектора
+            dictionary = CvAruco.GetPredefinedDictionary(PredefinedDictionaryName.Dict6X6_250);
+            detectorParameters = new DetectorParameters
+            {
+                CornerRefinementMethod = CornerRefineMethod.Subpix // Исправлено SubPix на Subpix
+                // При необходимости можно настроить и другие параметры уточнения:
+                // CornerRefinementWinSize = 5,
+                // CornerRefinementMaxIterations = 30,
+                // CornerRefinementMinAccuracy = 0.1
+            };
             // Обнаружение доступных камер
             var availableCameras = DetectCameras();
             if (availableCameras.Count < 2)
@@ -142,7 +156,7 @@ namespace StereoCalibration
             this.ClientSize = new System.Drawing.Size(1310, 1040);
             this.Text = "Stereo Calibration";
         }
-       
+
         private List<Point3f> GenerateObjectPoints()
         {
             List<Point3f> points = new List<Point3f>();
@@ -226,12 +240,14 @@ namespace StereoCalibration
 
         private void ProcessFrame(object sender, EventArgs e)
         {
-            // Проверка, открыты ли камеры
-            if (!capture1.IsOpened() || !capture2.IsOpened())
+            try
             {
-                MessageBox.Show("Одна из камер не открыта! Проверьте подключение.");
-                return;
-            }
+                // Проверка, открыты ли камеры
+                if (!capture1.IsOpened() || !capture2.IsOpened())
+                {
+                    MessageBox.Show("Одна из камер не открыта! Проверьте подключение.");
+                    return;
+                }
 
             // Получение кадров с камер
             bool frame1Captured = capture1.Read(frame1);
@@ -242,6 +258,219 @@ namespace StereoCalibration
             {
                 var fr1 = frame1.Clone();
                 var fr2 = frame2.Clone();
+
+                // Обнаружение и отрисовка ArUco маркеров на кадре 1
+                Point2f[][] cornersAruco1, rejectedAruco1;
+                int[] idsAruco1;
+                CvAruco.DetectMarkers(fr1, dictionary, out cornersAruco1, out idsAruco1, detectorParameters, out rejectedAruco1);
+                if (idsAruco1.Length > 0)
+                {
+                    CvAruco.DrawDetectedMarkers(fr1, cornersAruco1, idsAruco1);
+                }
+
+                // Обнаружение и отрисовка ArUco маркеров на кадре 2
+                Point2f[][] cornersAruco2, rejectedAruco2;
+                int[] idsAruco2;
+                CvAruco.DetectMarkers(fr2, dictionary, out cornersAruco2, out idsAruco2, detectorParameters, out rejectedAruco2);
+                if (idsAruco2.Length > 0)
+                {
+                    CvAruco.DrawDetectedMarkers(fr2, cornersAruco2, idsAruco2);
+                }
+
+                // Триангуляция ArUco маркеров (только если калибровка загружена)
+                if (calibrationResult != null && idsAruco1.Length > 0 && idsAruco2.Length > 0)
+                {
+                    try
+                    {
+                        Debug.WriteLine($"=== НАЧАЛО ТРИАНГУЛЯЦИИ ===");
+                        Debug.WriteLine($"Найдено маркеров: камера 1 - {idsAruco1.Length}, камера 2 - {idsAruco2.Length}");
+                    
+                    // Сопоставление маркеров по ID
+                    Dictionary<int, (Point2f[] left, Point2f[] right)> matchedMarkers = new Dictionary<int, (Point2f[], Point2f[])>();
+                    for (int i = 0; i < idsAruco1.Length; i++)
+                    {
+                        for (int j = 0; j < idsAruco2.Length; j++)
+                        {
+                            if (idsAruco1[i] == idsAruco2[j])
+                            {
+                                matchedMarkers[idsAruco1[i]] = (cornersAruco1[i], cornersAruco2[j]);
+                                Debug.WriteLine($"Найдено совпадение маркера ID {idsAruco1[i]}");
+                                break;
+                            }
+                        }
+                    }
+
+                    Debug.WriteLine($"Сопоставленных маркеров: {matchedMarkers.Count}");
+
+                    // Создаем матрицы камер один раз (они одинаковые для всех маркеров)
+                    Mat cameraMatrix1Mat = new Mat(3, 3, MatType.CV_64FC1);
+                    Mat cameraMatrix2Mat = new Mat(3, 3, MatType.CV_64FC1);
+                    Mat distCoeffs1Mat = new Mat(1, 5, MatType.CV_64FC1);
+                    Mat distCoeffs2Mat = new Mat(1, 5, MatType.CV_64FC1);
+
+                    // Заполняем матрицы калибровки
+                    for (int i = 0; i < 3; i++)
+                    {
+                        for (int j = 0; j < 3; j++)
+                        {
+                            cameraMatrix1Mat.Set(i, j, calibrationResult.CameraMatrix1[i, j]);
+                            cameraMatrix2Mat.Set(i, j, calibrationResult.CameraMatrix2[i, j]);
+                        }
+                    }
+                    for (int i = 0; i < 5; i++)
+                    {
+                        distCoeffs1Mat.Set(0, i, calibrationResult.DistCoeffs1[i]);
+                        distCoeffs2Mat.Set(0, i, calibrationResult.DistCoeffs2[i]);
+                    }
+
+                    Debug.WriteLine("Матрицы камер созданы");
+
+                    // Триангуляция для каждого маркера
+                    foreach (var marker in matchedMarkers)
+                    {
+                        int id = marker.Key;
+                        Point2f[] leftCorners = marker.Value.left;
+                        Point2f[] rightCorners = marker.Value.right;
+
+                        Debug.WriteLine($"--- Обработка маркера ID {id} ---");
+
+                        // Вычисляем центр маркера
+                        Point2f leftCenter = new Point2f(
+                            (leftCorners[0].X + leftCorners[1].X + leftCorners[2].X + leftCorners[3].X) / 4,
+                            (leftCorners[0].Y + leftCorners[1].Y + leftCorners[2].Y + leftCorners[3].Y) / 4
+                        );
+                        Point2f rightCenter = new Point2f(
+                            (rightCorners[0].X + rightCorners[1].X + rightCorners[2].X + rightCorners[3].X) / 4,
+                            (rightCorners[0].Y + rightCorners[1].Y + rightCorners[2].Y + rightCorners[3].Y) / 4
+                        );
+
+                        Debug.WriteLine($"Центры маркера: левый ({leftCenter.X:F2}, {leftCenter.Y:F2}), правый ({rightCenter.X:F2}, {rightCenter.Y:F2})");
+
+                        // Исправляем искажения точек
+                        Point2f[] leftCenterArray = new Point2f[] { leftCenter };
+                        Point2f[] rightCenterArray = new Point2f[] { rightCenter };
+                        
+                        Mat leftPointsMat = InputArray.Create(leftCenterArray).GetMat();
+                        Mat rightPointsMat = InputArray.Create(rightCenterArray).GetMat();
+                        Mat undistortedLeft = new Mat();
+                        Mat undistortedRight = new Mat();
+
+                        // Убираем искажения без ректификации
+                        Cv2.UndistortPoints(leftPointsMat, undistortedLeft, cameraMatrix1Mat, distCoeffs1Mat, null, cameraMatrix1Mat);
+                        Cv2.UndistortPoints(rightPointsMat, undistortedRight, cameraMatrix2Mat, distCoeffs2Mat, null, cameraMatrix2Mat);
+
+                        // Получаем исправленные точки
+                        Point2f leftUndistorted = undistortedLeft.At<Point2f>(0, 0);
+                        Point2f rightUndistorted = undistortedRight.At<Point2f>(0, 0);
+
+                        Debug.WriteLine($"Исправленные центры: левый ({leftUndistorted.X:F2}, {leftUndistorted.Y:F2}), правый ({rightUndistorted.X:F2}, {rightUndistorted.Y:F2})");
+
+                        // Создаем проекционные матрицы P1 = K1[I|0] и P2 = K2[R|T]
+                        Mat P1 = new Mat(3, 4, MatType.CV_64FC1);
+                        Mat P2 = new Mat(3, 4, MatType.CV_64FC1);
+
+                        // P1 = K1[I|0] - камера 1 в начале координат
+                        for (int i = 0; i < 3; i++)
+                        {
+                            for (int j = 0; j < 3; j++)
+                            {
+                                P1.Set(i, j, calibrationResult.CameraMatrix1[i, j]);
+                            }
+                            P1.Set(i, 3, 0.0);
+                        }
+
+                        // P2 = K2[R|T] - камера 2 в стерео системе
+                        // Сначала создаем [R|T]
+                        Mat RT = new Mat(3, 4, MatType.CV_64FC1);
+                        for (int i = 0; i < 3; i++)
+                        {
+                            for (int j = 0; j < 3; j++)
+                            {
+                                RT.Set(i, j, calibrationResult.R[i, j]);
+                            }
+                            RT.Set(i, 3, calibrationResult.T[i]);
+                        }
+
+                        // P2 = K2 * [R|T]
+                        P2 = cameraMatrix2Mat * RT;
+
+                        Debug.WriteLine("Проекционные матрицы созданы");
+                        Debug.WriteLine($"P1 размер: {P1.Rows}x{P1.Cols}, P2 размер: {P2.Rows}x{P2.Cols}");
+
+                        // Триангуляция - используем исправленные точки
+                        Mat points4D = new Mat();
+                        Point2d[] leftPoints = new Point2d[] { new Point2d(leftUndistorted.X, leftUndistorted.Y) };
+                        Point2d[] rightPoints = new Point2d[] { new Point2d(rightUndistorted.X, rightUndistorted.Y) };
+                        
+                        Cv2.TriangulatePoints(P1, P2, 
+                            InputArray.Create(leftPoints), 
+                            InputArray.Create(rightPoints), 
+                            points4D);
+
+                        Debug.WriteLine($"Результат триангуляции размер: {points4D.Rows}x{points4D.Cols}");
+
+                        // Преобразование из гомогенных координат
+                        double x = points4D.At<double>(0, 0);
+                        double y = points4D.At<double>(1, 0);
+                        double z = points4D.At<double>(2, 0);
+                        double w = points4D.At<double>(3, 0);
+
+                        Debug.WriteLine($"Гомогенные координаты: ({x:F6}, {y:F6}, {z:F6}, {w:F6})");
+
+                        if (Math.Abs(w) > 1e-7)
+                        {
+                            x /= w;
+                            y /= w;
+                            z /= w;
+
+                            Debug.WriteLine($"3D координаты в мм: ({x:F2}, {y:F2}, {z:F2})");
+
+                            double distance = Math.Sqrt(x * x + y * y + z * z);
+                            double distanceCm = distance / 10.0; // в см
+
+                            Debug.WriteLine($"Расстояние: {distance:F2} мм = {distanceCm:F1} см");
+
+                            // Проверка разумности результата
+                            if (distance > 50 && distance < 5000) // от 5 см до 5 метров
+                            {
+                                // Отображение расстояния
+                                Cv2.PutText(fr1,
+                                    $"ID {id}: {distanceCm:F1}cm",
+                                    new OpenCvSharp.Point((int)leftCenter.X, (int)leftCenter.Y - 10),
+                                    HersheyFonts.HersheySimplex,
+                                    0.6,
+                                    Scalar.Red,
+                                    2);
+
+                                Cv2.PutText(fr2,
+                                    $"ID {id}: {distanceCm:F1}cm",
+                                    new OpenCvSharp.Point((int)rightCenter.X, (int)rightCenter.Y - 10),
+                                    HersheyFonts.HersheySimplex,
+                                    0.6,
+                                    Scalar.Red,
+                                    2);
+
+                                Debug.WriteLine($"*** РЕЗУЛЬТАТ: Маркер {id} на расстоянии {distanceCm:F1} см ***");
+                            }
+                            else
+                            {
+                                Debug.WriteLine($"ПРЕДУПРЕЖДЕНИЕ: Нереалистичное расстояние {distance:F2} мм для маркера {id}");
+                            }
+                        }
+                        else
+                        {
+                            Debug.WriteLine($"ОШИБКА: Деление на ноль в гомогенных координатах для маркера {id}");
+                        }
+                    }
+                    
+                        Debug.WriteLine($"=== КОНЕЦ ТРИАНГУЛЯЦИИ ===");
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"ОШИБКА В ТРИАНГУЛЯЦИИ: {ex.Message}");
+                    }
+                }
+
                 Point2f[] corners1, corners2;
                 bool found1 = Cv2.FindChessboardCorners(frame1, patternSize, out corners1, ChessboardFlags.FastCheck);
                 bool found2 = Cv2.FindChessboardCorners(frame2, patternSize, out corners2, ChessboardFlags.FastCheck);
@@ -287,8 +516,15 @@ namespace StereoCalibration
                     pictureBox2.Image = BitmapConverter.ToBitmap(fr2);
                 }
 
-                if (calibrationResult != null && found1 && found2)
+                if (calibrationResult != null && found1 && found2 && ps_3d_all_out.Count > 0)
                 {
+                    // Проверяем, что количество точек соответствует количеству углов
+                    if (ps_3d_all_out.Count != corners1.Length || ps_3d_all_out.Count != corners2.Length)
+                    {
+                        Debug.WriteLine($"ПРЕДУПРЕЖДЕНИЕ: Несоответствие количества точек. ps_3d_all_out: {ps_3d_all_out.Count}, corners1: {corners1.Length}, corners2: {corners2.Length}");
+                        return;
+                    }
+                    
                     // Преобразование данных в Mat для SolvePnP
                     Mat objectPointsMat = new Mat(ps_3d_all_out.Count, 1, MatType.CV_32FC3);
                     for (int i = 0; i < ps_3d_all_out.Count; i++)
@@ -338,19 +574,21 @@ namespace StereoCalibration
                         distCoeffs2Mat.Set(0, i, calibrationResult.DistCoeffs2[i]);
                     }
 
-                    // SolvePnP для обеих камер
-                    double[] rvec1 = new double[3];
-                    double[] tvec1 = new double[3];
-                    double[] rvec2 = new double[3];
-                    double[] tvec2 = new double[3];
+                    try
+                    {
+                        // SolvePnP для обеих камер
+                        double[] rvec1 = new double[3];
+                        double[] tvec1 = new double[3];
+                        double[] rvec2 = new double[3];
+                        double[] tvec2 = new double[3];
 
-                    Mat rvec1Mat = new Mat(3, 1, MatType.CV_64FC1);
-                    Mat tvec1Mat = new Mat(3, 1, MatType.CV_64FC1);
-                    Mat rvec2Mat = new Mat(3, 1, MatType.CV_64FC1);
-                    Mat tvec2Mat = new Mat(3, 1, MatType.CV_64FC1);
+                        Mat rvec1Mat = new Mat(3, 1, MatType.CV_64FC1);
+                        Mat tvec1Mat = new Mat(3, 1, MatType.CV_64FC1);
+                        Mat rvec2Mat = new Mat(3, 1, MatType.CV_64FC1);
+                        Mat tvec2Mat = new Mat(3, 1, MatType.CV_64FC1);
 
-                    Cv2.SolvePnP(objectPointsMat, imagePoints1Mat, cameraMatrix1Mat, distCoeffs1Mat, rvec1Mat, tvec1Mat);
-                    Cv2.SolvePnP(objectPointsMat, imagePoints2Mat, cameraMatrix2Mat, distCoeffs2Mat, rvec2Mat, tvec2Mat);
+                        Cv2.SolvePnP(objectPointsMat, imagePoints1Mat, cameraMatrix1Mat, distCoeffs1Mat, rvec1Mat, tvec1Mat);
+                        Cv2.SolvePnP(objectPointsMat, imagePoints2Mat, cameraMatrix2Mat, distCoeffs2Mat, rvec2Mat, tvec2Mat);
 
                     // Извлечение данных из Mat в double[]
                     for (int i = 0; i < 3; i++)
@@ -403,7 +641,7 @@ namespace StereoCalibration
                     Debug.WriteLine($"Динамическое положение камеры 2 относительно камеры 1 (мм): X {dynamic_cam_dx:F2}, Y {dynamic_cam_dy:F2}, Z {dynamic_cam_dz:F2}");
                     Debug.WriteLine($"Динамическое положение камеры 1 относительно камеры 2 (мм): X {dynamic_cam1_x:F2}, Y {dynamic_cam1_y:F2}, Z {dynamic_cam1_z:F2}");
                     Debug.WriteLine($"Динамическое расстояние между камерами: {dynamic_cam_distance:F2} мм");
-                    
+
                     // Опционально: сравнение с статическим T для оценки стабильности
                     Mat T_static = new Mat(3, 1, MatType.CV_64FC1);
                     for (int i = 0; i < 3; i++)
@@ -454,17 +692,22 @@ namespace StereoCalibration
                     double cam1_x = -calibrationResult.T[0];
                     double cam1_y = -calibrationResult.T[1];
                     double cam1_z = -calibrationResult.T[2];
-                    
+
                     Debug.WriteLine($"Положение камеры 2 относительно камеры 1 (мм): X {cam_dx:F2}, Y {cam_dy:F2}, Z {cam_dz:F2}");
                     Debug.WriteLine($"Положение камеры 1 относительно камеры 2 (мм): X {cam1_x:F2}, Y {cam1_y:F2}, Z {cam1_z:F2}");
                     Debug.WriteLine($"Расстояние между камерами: {cam_distance:F2} мм");
-                   
+
                     Debug.WriteLine("Кадр с камеры 1 обновлен: " + frame1.GetHashCode());
                     Debug.WriteLine("Кадр с камеры 2 обновлен: " + frame2.GetHashCode());
                     Debug.WriteLine($"tvec1: X {tvec1[0]:F2}, Y {tvec1[1]:F2}, Z {tvec1[2]:F2}");
                     Debug.WriteLine($"tvec2: X {tvec2[0]:F2}, Y {tvec2[1]:F2}, Z {tvec2[2]:F2}");
-                    
-                    Debug.WriteLine($"Ошибка калибровки (мм): X {dx:F2}, Y {dy:F2}, Z {dz:F2}, Общая: {error:F2}");
+
+                        Debug.WriteLine($"Ошибка калибровки (мм): X {dx:F2}, Y {dy:F2}, Z {dz:F2}, Общая: {error:F2}");
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"ОШИБКА В SOLVEPNP: {ex.Message}");
+                    }
                 }
             }
             else
@@ -481,6 +724,12 @@ namespace StereoCalibration
                 Debug.WriteLine($"Расстояние между камерами: {distance} mm");
                 distancePrintCount++;
             }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"КРИТИЧЕСКАЯ ОШИБКА В PROCESSFRAME: {ex.Message}");
+                Debug.WriteLine($"Stack trace: {ex.StackTrace}");
+            }
         }
         private void CapturePairButton_Click(object sender, EventArgs e)
         {
@@ -492,7 +741,7 @@ namespace StereoCalibration
 
             Mat snapshot1 = frame1.Clone();
             Mat snapshot2 = frame2.Clone();
-            
+
 
 
 
@@ -641,19 +890,19 @@ namespace StereoCalibration
                         }
 
                         pairImagePointsList1.Add(imagePoints1);
-                        pairImagePointsList2.Add(imagePoints2);       
+                        pairImagePointsList2.Add(imagePoints2);
                         pairObjectPointsList.Add(objectPoints);
-                      /*  Cv2.CvtColor(gray1, gray1, ColorConversionCodes.GRAY2RGB);
-                        Cv2.CvtColor(gray2, gray2, ColorConversionCodes.GRAY2RGB);
-                        Cv2.DrawChessboardCorners(gray1, patternSize, corners1, found1);
-                        Cv2.DrawChessboardCorners(gray2, patternSize, corners2, found2);
-                        Cv2.ImShow("asfd1", gray1);
-                        Cv2.ImShow("asfd2", gray2);
-                        Cv2.WaitKey();*/
-                     
+                        /*  Cv2.CvtColor(gray1, gray1, ColorConversionCodes.GRAY2RGB);
+                          Cv2.CvtColor(gray2, gray2, ColorConversionCodes.GRAY2RGB);
+                          Cv2.DrawChessboardCorners(gray1, patternSize, corners1, found1);
+                          Cv2.DrawChessboardCorners(gray2, patternSize, corners2, found2);
+                          Cv2.ImShow("asfd1", gray1);
+                          Cv2.ImShow("asfd2", gray2);
+                          Cv2.WaitKey();*/
+
                     }
-                    
-              
+
+
                 }
             }
 
@@ -703,21 +952,22 @@ namespace StereoCalibration
             Mat E = new Mat();
             Mat F = new Mat();
 
-            var tvecs1 = new Vec3d[10];
-            var tvecs2 = new Vec3d[10];
-            var rvecs1 = new Vec3d[10];
-            var rvecs2 = new Vec3d[10];
-            //print_mat(pairObjectPointsList[0]);
-            //print_mat(pairImagePointsList1[0]);
-            /* var cameraMatrix1_double =(double[,]) to_double(cameraMatrix1);
-             var cameraMatrix2_double = (double[,])to_double(cameraMatrix2);
-
-
-             var distCoeffs1_double = (double[])to_double(distCoeffs1);
-             var distCoeffs2_double = (double[])to_double(distCoeffs2);*/
+            var tvecs1 = new Vec3d[ps_3d_all.Count];
+            var tvecs2 = new Vec3d[ps_3d_all.Count];
+            var rvecs1 = new Vec3d[ps_3d_all.Count];
+            var rvecs2 = new Vec3d[ps_3d_all.Count];
             var image_size = mats1[0].Size();
-            var err1 = Cv2.CalibrateCamera(ps_3d_all, ps_2d_all_1, image_size, cameraMatrix1, distCoeffs1, out rvecs1, out tvecs1, CalibrationFlags.None, new TermCriteria(CriteriaTypes.Count, 100, 0.1));
-            var err2 = Cv2.CalibrateCamera(ps_3d_all, ps_2d_all_2, image_size, cameraMatrix2, distCoeffs2, out rvecs2, out tvecs2, CalibrationFlags.None, new TermCriteria(CriteriaTypes.Count, 100, 0.1));
+            var err1 = Cv2.CalibrateCamera(ps_3d_all, ps_2d_all_1, image_size, cameraMatrix1, distCoeffs1, out rvecs1, out tvecs1, CalibrationFlags.None, new TermCriteria(CriteriaTypes.Eps | CriteriaTypes.MaxIter, 100, 1e-6));
+            var err2 = Cv2.CalibrateCamera(ps_3d_all, ps_2d_all_2, image_size, cameraMatrix2, distCoeffs2, out rvecs2, out tvecs2, CalibrationFlags.None, new TermCriteria(CriteriaTypes.Eps | CriteriaTypes.MaxIter, 100, 1e-6));
+            
+            Debug.WriteLine("Ошибки индивидуальной калибровки: " + err1 + " " + err2);
+            
+            // Проверяем качество индивидуальной калибровки
+            if (err1 > 1.0 || err2 > 1.0)
+            {
+                MessageBox.Show($"Предупреждение: Высокая ошибка индивидуальной калибровки. Камера 1: {err1:F3}, Камера 2: {err2:F3}");
+            }
+            
             print_double(cameraMatrix1);
             print_double(distCoeffs1);
             print_double(cameraMatrix2);
@@ -728,7 +978,7 @@ namespace StereoCalibration
             var rect_roi2 = new Rect();
             Cv2.GetOptimalNewCameraMatrix(cameraMatrix1, distCoeffs1, image_size, 1, image_size_opt, out rect_roi1);
             Cv2.GetOptimalNewCameraMatrix(cameraMatrix2, distCoeffs2, image_size, 1, image_size_opt, out rect_roi2);
-            Debug.WriteLine("rect_roi1"+rect_roi1.Width+ " " + rect_roi1.Height);
+            Debug.WriteLine("rect_roi1" + rect_roi1.Width + " " + rect_roi1.Height);
             Debug.WriteLine("rect_roi2" + rect_roi2.Width + " " + rect_roi2.Height);
             try
             {
@@ -736,9 +986,16 @@ namespace StereoCalibration
                     ps_3d_all,
                     ps_2d_all_1,
                     ps_2d_all_2,
-                    cameraMatrix1, distCoeffs1, cameraMatrix2, distCoeffs2,
-                    new OpenCvSharp.Size(640, 480), R, T, E, F,
-                    CalibrationFlags.RationalModel
+                    cameraMatrix1, 
+                    distCoeffs1, 
+                    cameraMatrix2, 
+                    distCoeffs2,
+                    image_size,
+                     R, 
+                     T,
+                      E, 
+                      F,
+                    CalibrationFlags.FixIntrinsic
                 );
 
                 // Преобразование Mat в массивы
@@ -759,7 +1016,22 @@ namespace StereoCalibration
                 string json = JsonConvert.SerializeObject(result, Formatting.Indented);
                 File.WriteAllText("calibration_result.json", json);
 
-                MessageBox.Show($"Калибровка успешна! Ошибка: {error}\nРезультаты сохранены в calibration_result.json");
+                // Дополнительная диагностика
+                Debug.WriteLine($"Стереокалибровка завершена. Ошибка: {error:F6}");
+                Debug.WriteLine($"Расстояние между камерами: {Math.Sqrt(result.T[0]*result.T[0] + result.T[1]*result.T[1] + result.T[2]*result.T[2]):F2} мм");
+                
+                // Проверка качества результатов
+                string qualityMessage = "";
+                if (error < 0.5)
+                    qualityMessage = " (Отличное качество)";
+                else if (error < 1.0)
+                    qualityMessage = " (Хорошее качество)";
+                else if (error < 2.0)
+                    qualityMessage = " (Удовлетворительное качество)";
+                else
+                    qualityMessage = " (Плохое качество - рекомендуется перекалибровка)";
+
+                MessageBox.Show($"Калибровка успешна! Ошибка: {error:F3}{qualityMessage}\nРезультаты сохранены в calibration_result.json");
             }
             catch (OpenCvSharp.OpenCVException ex)
             {
@@ -831,6 +1103,8 @@ namespace StereoCalibration
 
 
         }
+
+
     }
 
     public class CalibrationResult
