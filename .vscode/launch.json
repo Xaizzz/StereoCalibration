@@ -5,15 +5,28 @@
 	"version": "0.2.0",
 	"configurations": [
 		{
-			"name": ".NET Core Launch (console)",
+			"name": "Launch StereoCalibration (Windows Forms)",
 			"type": "coreclr",
 			"request": "launch",
 			"preLaunchTask": "build",
-			"program": "${workspaceFolder}/calibr/bin/Debug/net8.0-windows/StereoCalibration.dll",
+			"program": "${workspaceFolder}/calibr/bin/Debug/net8.0-windows/StereoCalibration.exe",
 			"args": [],
 			"cwd": "${workspaceFolder}/calibr",
 			"console": "internalConsole",
-			"stopAtEntry": false
+			"stopAtEntry": false,
+			"requireExactSource": false
+		},
+		{
+			"name": "Launch StereoCalibration (Debug Console)",
+			"type": "coreclr",
+			"request": "launch",
+			"preLaunchTask": "build",
+			"program": "${workspaceFolder}/calibr/bin/Debug/net8.0-windows/StereoCalibration.exe",
+			"args": [],
+			"cwd": "${workspaceFolder}/calibr",
+			"console": "externalTerminal",
+			"stopAtEntry": false,
+			"requireExactSource": false
 		},
 		{
 			"name": ".NET Core Attach",

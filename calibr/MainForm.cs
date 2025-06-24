@@ -21,17 +21,7 @@ namespace StereoCalibration
         private List<Mat> pairImagePointsList1, pairImagePointsList2;
         private List<Mat> pairObjectPointsList;
         private OpenCvSharp.Size patternSize = new OpenCvSharp.Size(9, 6); // Размер шахматной доски (10x7)
-        private const float squareSize = 9f; // Размер квадрата на доске в мм
-
-        // Размер маркера ArUco в миллиметрах
-        private float arucoMarkerSize = 45f; // Предполагаемый размер маркера - 5 см
-
-        // Порог репроекционной ошибки (можно регулировать для точности)
-        private float reprojectionErrorThreshold = 3.0f; // Увеличиваем порог для отображения результатов
-
-        // Словарь для хранения историй расстояний для каждого маркера
-        private Dictionary<int, List<double>> markerDistanceHistory = new Dictionary<int, List<double>>();
-        private const int MAX_HISTORY_SIZE = 5; // Максимальный размер истории для сглаживания
+        private const float squareSize = 8f; // Размер квадрата на доске в мм
 
         private System.Windows.Forms.Button StartButton;
         private System.Windows.Forms.Button OpenImagesButton;
@@ -250,12 +240,14 @@ namespace StereoCalibration
 
         private void ProcessFrame(object sender, EventArgs e)
         {
-            // Проверка, открыты ли камеры
-            if (!capture1.IsOpened() || !capture2.IsOpened())
+            try
             {
-                MessageBox.Show("Одна из камер не открыта! Проверьте подключение.");
-                return;
-            }
+                // Проверка, открыты ли камеры
+                if (!capture1.IsOpened() || !capture2.IsOpened())
+                {
+                    MessageBox.Show("Одна из камер не открыта! Проверьте подключение.");
+                    return;
+                }
 
             // Получение кадров с камер
             bool frame1Captured = capture1.Read(frame1);
@@ -285,409 +277,198 @@ namespace StereoCalibration
                     CvAruco.DrawDetectedMarkers(fr2, cornersAruco2, idsAruco2);
                 }
 
-                // ТРИАНГУЛЯЦИЯ ArUco МАРКЕРОВ
+                // Триангуляция ArUco маркеров (только если калибровка загружена)
                 if (calibrationResult != null && idsAruco1.Length > 0 && idsAruco2.Length > 0)
                 {
-                    // Переменные для хранения расстояния до маркера для отображения на главном экране
-                    string distanceDisplay = "";
-                    double? globalDistance = null;
-
-                    Mat camMatrix1Mat = new Mat(3, 3, MatType.CV_64FC1);
-                    for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) camMatrix1Mat.Set(r, c, calibrationResult.CameraMatrix1[r, c]);
-
-                    Mat distCoeffs1Mat = new Mat(1, calibrationResult.DistCoeffs1.Length, MatType.CV_64FC1);
-                    for (int i = 0; i < calibrationResult.DistCoeffs1.Length; i++) distCoeffs1Mat.Set(0, i, calibrationResult.DistCoeffs1[i]);
-
-                    Mat camMatrix2Mat = new Mat(3, 3, MatType.CV_64FC1);
-                    for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) camMatrix2Mat.Set(r, c, calibrationResult.CameraMatrix2[r, c]);
-
-                    Mat distCoeffs2Mat = new Mat(1, calibrationResult.DistCoeffs2.Length, MatType.CV_64FC1);
-                    for (int i = 0; i < calibrationResult.DistCoeffs2.Length; i++) distCoeffs2Mat.Set(0, i, calibrationResult.DistCoeffs2[i]);
-
-                    Mat R_stereoMat = new Mat(3, 3, MatType.CV_64FC1);
-                    for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) R_stereoMat.Set(r, c, calibrationResult.R[r, c]);
-
-                    Mat T_stereoMat = new Mat(3, 1, MatType.CV_64FC1);
-                    for (int i = 0; i < 3; i++) T_stereoMat.Set(i, 0, calibrationResult.T[i]);
-
-                    // Создаем правильные проекционные матрицы для триангуляции
-                    // !! Полностью переделываем проекционные матрицы, возможно некорректная калибровка
-                    
-                    // Для первой камеры: [I | 0]
-                    Mat P1 = new Mat(3, 4, MatType.CV_64FC1);
-                    
-                    // Установим внутренние параметры для P1
-                    P1.Set(0, 0, calibrationResult.CameraMatrix1[0, 0]);
-                    P1.Set(0, 1, calibrationResult.CameraMatrix1[0, 1]);
-                    P1.Set(0, 2, calibrationResult.CameraMatrix1[0, 2]);
-                    P1.Set(0, 3, 0);
-                    
-                    P1.Set(1, 0, calibrationResult.CameraMatrix1[1, 0]);
-                    P1.Set(1, 1, calibrationResult.CameraMatrix1[1, 1]);
-                    P1.Set(1, 2, calibrationResult.CameraMatrix1[1, 2]);
-                    P1.Set(1, 3, 0);
-                    
-                    P1.Set(2, 0, calibrationResult.CameraMatrix1[2, 0]);
-                    P1.Set(2, 1, calibrationResult.CameraMatrix1[2, 1]);
-                    P1.Set(2, 2, calibrationResult.CameraMatrix1[2, 2]);
-                    P1.Set(2, 3, 0);
-                    
-                    // Для второй камеры: [R | T]
-                    Mat P2 = new Mat(3, 4, MatType.CV_64FC1);
-                    Mat RT2 = new Mat(3, 4, MatType.CV_64FC1);
-                    
-                    // Заполняем RT2 [R|T]
-                    for (int i = 0; i < 3; i++)
+                    try
                     {
-                        for (int j = 0; j < 3; j++)
-                        {
-                            RT2.Set(i, j, calibrationResult.R[i, j]);
-                        }
-                        RT2.Set(i, 3, calibrationResult.T[i]);
-                    }
+                        Debug.WriteLine($"=== НАЧАЛО ТРИАНГУЛЯЦИИ ===");
+                        Debug.WriteLine($"Найдено маркеров: камера 1 - {idsAruco1.Length}, камера 2 - {idsAruco2.Length}");
                     
-                    // Установим внутренние параметры для P2
-                    for (int i = 0; i < 3; i++)
+                    // Сопоставление маркеров по ID
+                    Dictionary<int, (Point2f[] left, Point2f[] right)> matchedMarkers = new Dictionary<int, (Point2f[], Point2f[])>();
+                    for (int i = 0; i < idsAruco1.Length; i++)
                     {
-                        for (int j = 0; j < 3; j++)
+                        for (int j = 0; j < idsAruco2.Length; j++)
                         {
-                            double sum = 0;
-                            for (int k = 0; k < 3; k++)
+                            if (idsAruco1[i] == idsAruco2[j])
                             {
-                                sum += calibrationResult.CameraMatrix2[i, k] * RT2.At<double>(k, j);
+                                matchedMarkers[idsAruco1[i]] = (cornersAruco1[i], cornersAruco2[j]);
+                                Debug.WriteLine($"Найдено совпадение маркера ID {idsAruco1[i]}");
+                                break;
                             }
-                            P2.Set(i, j, sum);
                         }
-                        
-                        // Последний столбец
-                        double sumLastCol = 0;
-                        for (int k = 0; k < 3; k++)
-                        {
-                            sumLastCol += calibrationResult.CameraMatrix2[i, k] * RT2.At<double>(k, 3);
-                        }
-                        P2.Set(i, 3, sumLastCol);
                     }
 
-                    // Отладочная информация о проекционных матрицах
-                    Debug.WriteLine("Проекционная матрица P1:");
-                    print_mat(P1);
-                    Debug.WriteLine("Проекционная матрица P2:");
-                    print_mat(P2);
-                    
-                    // Отображаем расстояние между камерами
-                    double camDistance = Math.Sqrt(
-                        calibrationResult.T[0] * calibrationResult.T[0] +
-                        calibrationResult.T[1] * calibrationResult.T[1] + 
-                        calibrationResult.T[2] * calibrationResult.T[2]);
-                    
-                    Cv2.PutText(fr1, $"The distance between the cameras: {camDistance:F1} mm", 
-                        new OpenCvSharp.Point(10, 30), HersheyFonts.HersheySimplex, 0.6, new Scalar(255, 255, 0), 2);
-                    Cv2.PutText(fr2, $"The distance between the cameras: {camDistance:F1} mm", 
-                        new OpenCvSharp.Point(10, 30), HersheyFonts.HersheySimplex, 0.6, new Scalar(255, 255, 0), 2);
+                    Debug.WriteLine($"Сопоставленных маркеров: {matchedMarkers.Count}");
 
-                    var arucoIds1List = idsAruco1.ToList();
-                    var arucoIds2List = idsAruco2.ToList();
+                    // Создаем матрицы камер один раз (они одинаковые для всех маркеров)
+                    Mat cameraMatrix1Mat = new Mat(3, 3, MatType.CV_64FC1);
+                    Mat cameraMatrix2Mat = new Mat(3, 3, MatType.CV_64FC1);
+                    Mat distCoeffs1Mat = new Mat(1, 5, MatType.CV_64FC1);
+                    Mat distCoeffs2Mat = new Mat(1, 5, MatType.CV_64FC1);
 
-                    for (int idx1 = 0; idx1 < arucoIds1List.Count; idx1++)
+                    // Заполняем матрицы калибровки
+                    for (int i = 0; i < 3; i++)
                     {
-                        int markerId = arucoIds1List[idx1];
-                        int idx2 = arucoIds2List.IndexOf(markerId);
-
-                        if (idx2 != -1) // Маркер найден на обоих изображениях
+                        for (int j = 0; j < 3; j++)
                         {
-                            Point2f[] markerCornersCam1 = cornersAruco1[idx1];
-                            Point2f[] markerCornersCam2 = cornersAruco2[idx2];
+                            cameraMatrix1Mat.Set(i, j, calibrationResult.CameraMatrix1[i, j]);
+                            cameraMatrix2Mat.Set(i, j, calibrationResult.CameraMatrix2[i, j]);
+                        }
+                    }
+                    for (int i = 0; i < 5; i++)
+                    {
+                        distCoeffs1Mat.Set(0, i, calibrationResult.DistCoeffs1[i]);
+                        distCoeffs2Mat.Set(0, i, calibrationResult.DistCoeffs2[i]);
+                    }
 
-                            Point2f centerCam1 = new Point2f(markerCornersCam1.Average(p => p.X), markerCornersCam1.Average(p => p.Y));
-                            Point2f centerCam2 = new Point2f(markerCornersCam2.Average(p => p.X), markerCornersCam2.Average(p => p.Y));
+                    Debug.WriteLine("Матрицы камер созданы");
 
-                            // Устранение искажений для точек центра маркера и перевод в нормализованные координаты
-                            Mat distortedPoints1 = Mat.FromArray(new[] { centerCam1 });
-                            Mat undistortedPoints1Mat = new Mat();
-                            Cv2.UndistortPoints(distortedPoints1, undistortedPoints1Mat, camMatrix1Mat, distCoeffs1Mat);
+                    // Триангуляция для каждого маркера
+                    foreach (var marker in matchedMarkers)
+                    {
+                        int id = marker.Key;
+                        Point2f[] leftCorners = marker.Value.left;
+                        Point2f[] rightCorners = marker.Value.right;
 
-                            Mat distortedPoints2 = Mat.FromArray(new[] { centerCam2 });
-                            Mat undistortedPoints2Mat = new Mat();
-                            Cv2.UndistortPoints(distortedPoints2, undistortedPoints2Mat, camMatrix2Mat, distCoeffs2Mat);
+                        Debug.WriteLine($"--- Обработка маркера ID {id} ---");
 
-                            // Извлечение нормализованных координат
-                            Point2f undistortedCenter1 = undistortedPoints1Mat.Get<Point2f>(0, 0);
-                            Point2f undistortedCenter2 = undistortedPoints2Mat.Get<Point2f>(0, 0);
+                        // Вычисляем центр маркера
+                        Point2f leftCenter = new Point2f(
+                            (leftCorners[0].X + leftCorners[1].X + leftCorners[2].X + leftCorners[3].X) / 4,
+                            (leftCorners[0].Y + leftCorners[1].Y + leftCorners[2].Y + leftCorners[3].Y) / 4
+                        );
+                        Point2f rightCenter = new Point2f(
+                            (rightCorners[0].X + rightCorners[1].X + rightCorners[2].X + rightCorners[3].X) / 4,
+                            (rightCorners[0].Y + rightCorners[1].Y + rightCorners[2].Y + rightCorners[3].Y) / 4
+                        );
 
-                            // Отладочная информация о координатах
-                            Debug.WriteLine($"Normalized coordinates 1: ({undistortedCenter1.X:F4}, {undistortedCenter1.Y:F4})");
-                            Debug.WriteLine($"Normalized coordinates 2: ({undistortedCenter2.X:F4}, {undistortedCenter2.Y:F4})");
+                        Debug.WriteLine($"Центры маркера: левый ({leftCenter.X:F2}, {leftCenter.Y:F2}), правый ({rightCenter.X:F2}, {rightCenter.Y:F2})");
 
-                            // Подготовка точек для триангуляции
-                            Mat pt1Mat = new Mat(2, 1, MatType.CV_64FC1);
-                            pt1Mat.Set(0, 0, undistortedCenter1.X);
-                            pt1Mat.Set(1, 0, undistortedCenter1.Y);
+                        // Исправляем искажения точек
+                        Point2f[] leftCenterArray = new Point2f[] { leftCenter };
+                        Point2f[] rightCenterArray = new Point2f[] { rightCenter };
+                        
+                        Mat leftPointsMat = InputArray.Create(leftCenterArray).GetMat();
+                        Mat rightPointsMat = InputArray.Create(rightCenterArray).GetMat();
+                        Mat undistortedLeft = new Mat();
+                        Mat undistortedRight = new Mat();
 
-                            Mat pt2Mat = new Mat(2, 1, MatType.CV_64FC1);
-                            pt2Mat.Set(0, 0, undistortedCenter2.X);
-                            pt2Mat.Set(1, 0, undistortedCenter2.Y);
+                        // Убираем искажения без ректификации
+                        Cv2.UndistortPoints(leftPointsMat, undistortedLeft, cameraMatrix1Mat, distCoeffs1Mat, null, cameraMatrix1Mat);
+                        Cv2.UndistortPoints(rightPointsMat, undistortedRight, cameraMatrix2Mat, distCoeffs2Mat, null, cameraMatrix2Mat);
 
-                            // Триангуляция точек
-                            Mat points4D = new Mat();
-                            Cv2.TriangulatePoints(P1, P2, pt1Mat, pt2Mat, points4D);
+                        // Получаем исправленные точки
+                        Point2f leftUndistorted = undistortedLeft.At<Point2f>(0, 0);
+                        Point2f rightUndistorted = undistortedRight.At<Point2f>(0, 0);
 
-                            if (!points4D.Empty() && points4D.Rows == 4 && points4D.Cols == 1)
+                        Debug.WriteLine($"Исправленные центры: левый ({leftUndistorted.X:F2}, {leftUndistorted.Y:F2}), правый ({rightUndistorted.X:F2}, {rightUndistorted.Y:F2})");
+
+                        // Создаем проекционные матрицы P1 = K1[I|0] и P2 = K2[R|T]
+                        Mat P1 = new Mat(3, 4, MatType.CV_64FC1);
+                        Mat P2 = new Mat(3, 4, MatType.CV_64FC1);
+
+                        // P1 = K1[I|0] - камера 1 в начале координат
+                        for (int i = 0; i < 3; i++)
+                        {
+                            for (int j = 0; j < 3; j++)
                             {
-                                double hx = points4D.At<double>(0, 0);
-                                double hy = points4D.At<double>(1, 0);
-                                double hz = points4D.At<double>(2, 0);
-                                double hw = points4D.At<double>(3, 0);
+                                P1.Set(i, j, calibrationResult.CameraMatrix1[i, j]);
+                            }
+                            P1.Set(i, 3, 0.0);
+                        }
 
-                                Debug.WriteLine($"Homogeneous coordinates: X={hx:F6}, Y={hy:F6}, Z={hz:F6}, W={hw:F6}");
-                                
-                                double hw_orig = hw; // Сохраняем оригинальное значение для отладки
-                                
-                                // Отображение результатов триангуляции на изображениях
-                                string hwInfo = $"hw={hw_orig:F4}";
-                                Cv2.PutText(fr1, hwInfo, new OpenCvSharp.Point(10, fr1.Rows - 10), 
-                                    HersheyFonts.HersheySimplex, 0.5, new Scalar(0, 255, 255), 1);
-                                Cv2.PutText(fr2, hwInfo, new OpenCvSharp.Point(10, fr2.Rows - 10), 
-                                    HersheyFonts.HersheySimplex, 0.5, new Scalar(0, 255, 255), 1);
-                                
-                                // Инвертируем все координаты, если hw отрицательный
-                                // Это может исправить проблему с ориентацией камер
-                                if (hw_orig < 0)
-                                {
-                                    hx = -hx;
-                                    hy = -hy;
-                                    hz = -hz;
-                                    hw = -hw_orig; // Используем положительное значение hw
-                                }
-                                else
-                                {
-                                    hw = hw_orig; // Используем исходное положительное значение
-                                }
+                        // P2 = K2[R|T] - камера 2 в стерео системе
+                        // Сначала создаем [R|T]
+                        Mat RT = new Mat(3, 4, MatType.CV_64FC1);
+                        for (int i = 0; i < 3; i++)
+                        {
+                            for (int j = 0; j < 3; j++)
+                            {
+                                RT.Set(i, j, calibrationResult.R[i, j]);
+                            }
+                            RT.Set(i, 3, calibrationResult.T[i]);
+                        }
 
-                                if (!double.IsNaN(hw) && !double.IsInfinity(hw) && hw > 1e-9)
-                                {
-                                    // Преобразование из гомогенных координат в Евклидовы
-                                    double X = hx / hw;
-                                    double Y = hy / hw;
-                                    double Z = hz / hw;
-                                    
-                                    // Больше не нужно инвертировать координаты, мы уже сделали это выше
-                                    
-                                    // Отладочная информация
-                                    Debug.WriteLine($"Евклидовы координаты после нормализации: X={X:F2}, Y={Y:F2}, Z={Z:F2}");
+                        // P2 = K2 * [R|T]
+                        P2 = cameraMatrix2Mat * RT;
 
-                                    // Вычисление репроекционной ошибки для проверки точности триангуляции
-                                    Mat point3D = new Mat(4, 1, MatType.CV_64FC1);
-                                    point3D.Set(0, 0, X);
-                                    point3D.Set(1, 0, Y);
-                                    point3D.Set(2, 0, Z);
-                                    point3D.Set(3, 0, 1.0);
+                        Debug.WriteLine("Проекционные матрицы созданы");
+                        Debug.WriteLine($"P1 размер: {P1.Rows}x{P1.Cols}, P2 размер: {P2.Rows}x{P2.Cols}");
 
-                                    // Репроекция 3D точки обратно на изображение камеры 1
-                                    Mat reprojection1 = P1 * point3D;
-                                    double rx1 = reprojection1.At<double>(0, 0) / reprojection1.At<double>(2, 0);
-                                    double ry1 = reprojection1.At<double>(1, 0) / reprojection1.At<double>(2, 0);
+                        // Триангуляция - используем исправленные точки
+                        Mat points4D = new Mat();
+                        Point2d[] leftPoints = new Point2d[] { new Point2d(leftUndistorted.X, leftUndistorted.Y) };
+                        Point2d[] rightPoints = new Point2d[] { new Point2d(rightUndistorted.X, rightUndistorted.Y) };
+                        
+                        Cv2.TriangulatePoints(P1, P2, 
+                            InputArray.Create(leftPoints), 
+                            InputArray.Create(rightPoints), 
+                            points4D);
 
-                                    // Репроекция 3D точки обратно на изображение камеры 2
-                                    Mat reprojection2 = P2 * point3D;
-                                    double rx2 = reprojection2.At<double>(0, 0) / reprojection2.At<double>(2, 0);
-                                    double ry2 = reprojection2.At<double>(1, 0) / reprojection2.At<double>(2, 0);
+                        Debug.WriteLine($"Результат триангуляции размер: {points4D.Rows}x{points4D.Cols}");
 
-                                    // Вычисление репроекционной ошибки
-                                    double reproj_error1 = Math.Sqrt(Math.Pow(undistortedCenter1.X - rx1, 2) + Math.Pow(undistortedCenter1.Y - ry1, 2));
-                                    double reproj_error2 = Math.Sqrt(Math.Pow(undistortedCenter2.X - rx2, 2) + Math.Pow(undistortedCenter2.Y - ry2, 2));
-                                    double avg_reproj_error = (reproj_error1 + reproj_error2) / 2;
+                        // Преобразование из гомогенных координат
+                        double x = points4D.At<double>(0, 0);
+                        double y = points4D.At<double>(1, 0);
+                        double z = points4D.At<double>(2, 0);
+                        double w = points4D.At<double>(3, 0);
 
-                                    if (Z > 0) // Проверяем, что точка перед камерой 1
-                                    {
-                                        // Проверка для камеры 2
-                                        // Точка (X,Y,Z) в системе координат камеры 1
-                                        // Преобразуем ее в систему координат камеры 2: X_c2 = R * X_c1 + T_stereo
-                                        double X_c2 = R_stereoMat.At<double>(0, 0) * X + R_stereoMat.At<double>(0, 1) * Y + R_stereoMat.At<double>(0, 2) * Z + T_stereoMat.At<double>(0, 0);
-                                        double Y_c2 = R_stereoMat.At<double>(1, 0) * X + R_stereoMat.At<double>(1, 1) * Y + R_stereoMat.At<double>(1, 2) * Z + T_stereoMat.At<double>(1, 0);
-                                        double Z_c2 = R_stereoMat.At<double>(2, 0) * X + R_stereoMat.At<double>(2, 1) * Y + R_stereoMat.At<double>(2, 2) * Z + T_stereoMat.At<double>(2, 0);
+                        Debug.WriteLine($"Гомогенные координаты: ({x:F6}, {y:F6}, {z:F6}, {w:F6})");
 
-                                        if (Z_c2 > 0) // Проверяем, что точка перед камерой 2
-                                        {
-                                            // Расстояние от первой камеры
-                                            double distanceFromCam1 = Math.Sqrt(X * X + Y * Y + Z * Z);
-                                            
-                                            // Расстояние от второй камеры
-                                            double distanceFromCam2 = Math.Sqrt(X_c2 * X_c2 + Y_c2 * Y_c2 + Z_c2 * Z_c2);
-                                            
-                                            // Усредненное расстояние
-                                            double avgDistance = (distanceFromCam1 + distanceFromCam2) / 2.0;
-                                            
-                                            // Применяем фильтрацию для устранения скачков в измерениях расстояния
-                                            double filteredDistance = GetFilteredDistance(markerId, avgDistance);
-                                            
-                                            // Для корректности триангуляции, репроекционная ошибка должна быть малой
-                                            if (avg_reproj_error < reprojectionErrorThreshold) // Используем настраиваемый порог ошибки
-                                            {
-                                                Debug.WriteLine($"Маркер ID {markerId}: 3D ({X:F2}, {Y:F2}, {Z:F2}) мм");
-                                                Debug.WriteLine($"Расстояние от камеры 1: {distanceFromCam1:F2} мм, от камеры 2: {distanceFromCam2:F2} мм");
-                                                Debug.WriteLine($"Исходное расстояние: {avgDistance:F2} мм, Фильтрованное: {filteredDistance:F2} мм");
-                                                Debug.WriteLine($"Репрoекц. ошибка: {avg_reproj_error:F4}");
-                                                
-                                                // Отображение текста расстояния на изображении
-                                                Cv2.PutText(fr1, $"ID {markerId}: {filteredDistance:F1} mm", 
-                                                    new OpenCvSharp.Point(centerCam1.X + 10, centerCam1.Y), 
-                                                    HersheyFonts.HersheySimplex, 0.5, Scalar.Red, 2);
-                                                
-                                                Cv2.PutText(fr2, $"ID {markerId}: {filteredDistance:F1} mm", 
-                                                    new OpenCvSharp.Point(centerCam2.X + 10, centerCam2.Y), 
-                                                    HersheyFonts.HersheySimplex, 0.5, Scalar.Red, 2);
-                                                
-                                                // Отображаем 3D координаты маркера
-                                                Cv2.PutText(fr1, $"3D: ({X:F1},{Y:F1},{Z:F1})mm", 
-                                                    new OpenCvSharp.Point(centerCam1.X + 10, centerCam1.Y + 25), 
-                                                    HersheyFonts.HersheySimplex, 0.5, new Scalar(0, 255, 255), 2);
-                                                
-                                                Cv2.PutText(fr2, $"3D: ({X:F1},{Y:F1},{Z:F1})mm", 
-                                                    new OpenCvSharp.Point(centerCam2.X + 10, centerCam2.Y + 25), 
-                                                    HersheyFonts.HersheySimplex, 0.5, new Scalar(0, 255, 255), 2);
-                                                
-                                                // Преобразование нормализованных координат обратно в пиксельные для отображения
-                                                Point2f pixelOriginal1 = new Point2f(
-                                                    (float)(camMatrix1Mat.At<double>(0, 0) * undistortedCenter1.X + camMatrix1Mat.At<double>(0, 2)),
-                                                    (float)(camMatrix1Mat.At<double>(1, 1) * undistortedCenter1.Y + camMatrix1Mat.At<double>(1, 2))
-                                                );
-                                                
-                                                Point2f pixelReprojected1 = new Point2f(
-                                                    (float)(camMatrix1Mat.At<double>(0, 0) * rx1 + camMatrix1Mat.At<double>(0, 2)),
-                                                    (float)(camMatrix1Mat.At<double>(1, 1) * ry1 + camMatrix1Mat.At<double>(1, 2))
-                                                );
-                                                
-                                                Point2f pixelOriginal2 = new Point2f(
-                                                    (float)(camMatrix2Mat.At<double>(0, 0) * undistortedCenter2.X + camMatrix2Mat.At<double>(0, 2)),
-                                                    (float)(camMatrix2Mat.At<double>(1, 1) * undistortedCenter2.Y + camMatrix2Mat.At<double>(1, 2))
-                                                );
-                                                
-                                                Point2f pixelReprojected2 = new Point2f(
-                                                    (float)(camMatrix2Mat.At<double>(0, 0) * rx2 + camMatrix2Mat.At<double>(0, 2)),
-                                                    (float)(camMatrix2Mat.At<double>(1, 1) * ry2 + camMatrix2Mat.At<double>(1, 2))
-                                                );
-                                                
-                                                // Визуализация репроекционной ошибки
-                                                DrawReprojectionError(fr1, centerCam1, pixelReprojected1, $"Err: {reproj_error1:F2}");
-                                                DrawReprojectionError(fr2, centerCam2, pixelReprojected2, $"Err: {reproj_error2:F2}");
+                        if (Math.Abs(w) > 1e-7)
+                        {
+                            x /= w;
+                            y /= w;
+                            z /= w;
 
-                                                // Устанавливаем глобальное расстояние для отображения в верхней части экрана
-                                                globalDistance = filteredDistance;
-                                                distanceDisplay = $"Distance: {filteredDistance:F1} mm";
-                                            }
-                                            else
-                                            {
-                                                // Показываем расстояние даже при высокой репроекционной ошибке
-                                                Debug.WriteLine($"Маркер ID {markerId}: Большая репроекционная ошибка ({avg_reproj_error:F4})");
-                                                
-                                                // Вычисляем расстояние напрямую из 3D координат
-                                                double rawDistance = Math.Sqrt(X * X + Y * Y + Z * Z);
-                                                
-                                                // Применяем фильтрацию
-                                                double filteredRawDistance = GetFilteredDistance(markerId, rawDistance);
-                                                
-                                                // Отображаем с предупреждением о высокой ошибке
-                                                globalDistance = filteredRawDistance;
-                                                distanceDisplay = $"Distance: {filteredRawDistance:F1} mm (not sure)";
-                                                
-                                                // Отображаем расстояние и предупреждение на изображениях
-                                                Cv2.PutText(fr1, $"ID {markerId}: {filteredRawDistance:F1} mm", 
-                                                    new OpenCvSharp.Point(centerCam1.X + 10, centerCam1.Y), 
-                                                    HersheyFonts.HersheySimplex, 0.5, new Scalar(0, 0, 255), 2);
-                                                
-                                                Cv2.PutText(fr2, $"ID {markerId}: {filteredRawDistance:F1} mm", 
-                                                    new OpenCvSharp.Point(centerCam2.X + 10, centerCam2.Y), 
-                                                    HersheyFonts.HersheySimplex, 0.5, new Scalar(0, 0, 255), 2);
-                                                
-                                                // Отображаем 3D координаты и ошибку
-                                                Cv2.PutText(fr1, $"3D: ({X:F1},{Y:F1},{Z:F1})mm Err:{avg_reproj_error:F1}", 
-                                                    new OpenCvSharp.Point(centerCam1.X + 10, centerCam1.Y + 25), 
-                                                    HersheyFonts.HersheySimplex, 0.5, new Scalar(0, 0, 255), 2);
-                                                
-                                                Cv2.PutText(fr2, $"3D: ({X:F1},{Y:F1},{Z:F1})mm Err:{avg_reproj_error:F1}", 
-                                                    new OpenCvSharp.Point(centerCam2.X + 10, centerCam2.Y + 25), 
-                                                    HersheyFonts.HersheySimplex, 0.5, new Scalar(0, 0, 255), 2);
-                                            }
-                                        }
-                                        else
-                                        {
-                                            Debug.WriteLine($"Маркер ID {markerId}: Триангулированная точка за камерой 2 (Z_c2={Z_c2:F2})");
-                                        }
-                                    }
-                                    else
-                                    {
-                                        Debug.WriteLine($"Маркер ID {markerId}: Триангулированная точка за камерой 1 (Z_c1={Z:F2})");
-                                    }
-                                    
-                                    // Освобождение ресурсов
-                                    point3D.Dispose();
-                                    reprojection1.Dispose();
-                                    reprojection2.Dispose();
-                                }
-                                else
-                                {
-                                    Debug.WriteLine($"Маркер ID {markerId}: Проблема с гомогенными координатами (hw={hw:E2})");
-                                }
+                            Debug.WriteLine($"3D координаты в мм: ({x:F2}, {y:F2}, {z:F2})");
+
+                            double distance = Math.Sqrt(x * x + y * y + z * z);
+                            double distanceCm = distance / 10.0; // в см
+
+                            Debug.WriteLine($"Расстояние: {distance:F2} мм = {distanceCm:F1} см");
+
+                            // Проверка разумности результата
+                            if (distance > 50 && distance < 5000) // от 5 см до 5 метров
+                            {
+                                // Отображение расстояния
+                                Cv2.PutText(fr1,
+                                    $"ID {id}: {distanceCm:F1}cm",
+                                    new OpenCvSharp.Point((int)leftCenter.X, (int)leftCenter.Y - 10),
+                                    HersheyFonts.HersheySimplex,
+                                    0.6,
+                                    Scalar.Red,
+                                    2);
+
+                                Cv2.PutText(fr2,
+                                    $"ID {id}: {distanceCm:F1}cm",
+                                    new OpenCvSharp.Point((int)rightCenter.X, (int)rightCenter.Y - 10),
+                                    HersheyFonts.HersheySimplex,
+                                    0.6,
+                                    Scalar.Red,
+                                    2);
+
+                                Debug.WriteLine($"*** РЕЗУЛЬТАТ: Маркер {id} на расстоянии {distanceCm:F1} см ***");
                             }
                             else
                             {
-                                Debug.WriteLine($"Маркер ID {markerId}: points4D пуст или имеет неверный размер после триангуляции.");
+                                Debug.WriteLine($"ПРЕДУПРЕЖДЕНИЕ: Нереалистичное расстояние {distance:F2} мм для маркера {id}");
                             }
-                            // Освобождение ресурсов
-                            pt1Mat.Dispose();
-                            pt2Mat.Dispose();
-                            points4D.Dispose();
-                            distortedPoints1.Dispose();
-                            undistortedPoints1Mat.Dispose();
-                            distortedPoints2.Dispose();
-                            undistortedPoints2Mat.Dispose();
+                        }
+                        else
+                        {
+                            Debug.WriteLine($"ОШИБКА: Деление на ноль в гомогенных координатах для маркера {id}");
                         }
                     }
                     
-                    // Освобождение ресурсов
-                    camMatrix1Mat.Dispose();
-                    distCoeffs1Mat.Dispose();
-                    camMatrix2Mat.Dispose();
-                    distCoeffs2Mat.Dispose();
-                    R_stereoMat.Dispose();
-                    T_stereoMat.Dispose();
-                    P1.Dispose();
-                    P2.Dispose();
-                    RT2.Dispose();
-
-                    // Отображаем крупное расстояние до маркера в верхней части экрана
-                    if (globalDistance.HasValue)
-                    {
-                        // Создаем тень для лучшей видимости
-                        Cv2.PutText(fr1, distanceDisplay, 
-                            new OpenCvSharp.Point(fr1.Cols / 2 - 150, 70), 
-                            HersheyFonts.HersheySimplex, 1.2, Scalar.Black, 4);
-                        Cv2.PutText(fr1, distanceDisplay, 
-                            new OpenCvSharp.Point(fr1.Cols / 2 - 150, 70), 
-                            HersheyFonts.HersheySimplex, 1.2, Scalar.Yellow, 2);
-                        
-                        Cv2.PutText(fr2, distanceDisplay, 
-                            new OpenCvSharp.Point(fr2.Cols / 2 - 150, 70), 
-                            HersheyFonts.HersheySimplex, 1.2, Scalar.Black, 4);
-                        Cv2.PutText(fr2, distanceDisplay, 
-                            new OpenCvSharp.Point(fr2.Cols / 2 - 150, 70), 
-                            HersheyFonts.HersheySimplex, 1.2, Scalar.Yellow, 2);
+                        Debug.WriteLine($"=== КОНЕЦ ТРИАНГУЛЯЦИИ ===");
                     }
-
-                    // Отображаем информацию о настройках на экране
-                    Cv2.PutText(fr1, $"Error threshold: {reprojectionErrorThreshold:F1}", 
-                        new OpenCvSharp.Point(10, fr1.Rows - 40), 
-                        HersheyFonts.HersheySimplex, 0.5, new Scalar(255, 255, 255), 1);
-                    Cv2.PutText(fr2, $"Error threshold: {reprojectionErrorThreshold:F1}", 
-                        new OpenCvSharp.Point(10, fr2.Rows - 40), 
-                        HersheyFonts.HersheySimplex, 0.5, new Scalar(255, 255, 255), 1);
-
-                    Cv2.PutText(fr1, $"Marker Size: {arucoMarkerSize} mm", 
-                        new OpenCvSharp.Point(10, fr1.Rows - 70), 
-                        HersheyFonts.HersheySimplex, 0.5, new Scalar(255, 255, 255), 1);
-                    Cv2.PutText(fr2, $"Marker Size: {arucoMarkerSize} mm", 
-                        new OpenCvSharp.Point(10, fr2.Rows - 70), 
-                        HersheyFonts.HersheySimplex, 0.5, new Scalar(255, 255, 255), 1);
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"ОШИБКА В ТРИАНГУЛЯЦИИ: {ex.Message}");
+                    }
                 }
 
                 Point2f[] corners1, corners2;
@@ -735,8 +516,15 @@ namespace StereoCalibration
                     pictureBox2.Image = BitmapConverter.ToBitmap(fr2);
                 }
 
-                if (calibrationResult != null && found1 && found2)
+                if (calibrationResult != null && found1 && found2 && ps_3d_all_out.Count > 0)
                 {
+                    // Проверяем, что количество точек соответствует количеству углов
+                    if (ps_3d_all_out.Count != corners1.Length || ps_3d_all_out.Count != corners2.Length)
+                    {
+                        Debug.WriteLine($"ПРЕДУПРЕЖДЕНИЕ: Несоответствие количества точек. ps_3d_all_out: {ps_3d_all_out.Count}, corners1: {corners1.Length}, corners2: {corners2.Length}");
+                        return;
+                    }
+                    
                     // Преобразование данных в Mat для SolvePnP
                     Mat objectPointsMat = new Mat(ps_3d_all_out.Count, 1, MatType.CV_32FC3);
                     for (int i = 0; i < ps_3d_all_out.Count; i++)
@@ -786,19 +574,21 @@ namespace StereoCalibration
                         distCoeffs2Mat.Set(0, i, calibrationResult.DistCoeffs2[i]);
                     }
 
-                    // SolvePnP для обеих камер
-                    double[] rvec1 = new double[3];
-                    double[] tvec1 = new double[3];
-                    double[] rvec2 = new double[3];
-                    double[] tvec2 = new double[3];
+                    try
+                    {
+                        // SolvePnP для обеих камер
+                        double[] rvec1 = new double[3];
+                        double[] tvec1 = new double[3];
+                        double[] rvec2 = new double[3];
+                        double[] tvec2 = new double[3];
 
-                    Mat rvec1Mat = new Mat(3, 1, MatType.CV_64FC1);
-                    Mat tvec1Mat = new Mat(3, 1, MatType.CV_64FC1);
-                    Mat rvec2Mat = new Mat(3, 1, MatType.CV_64FC1);
-                    Mat tvec2Mat = new Mat(3, 1, MatType.CV_64FC1);
+                        Mat rvec1Mat = new Mat(3, 1, MatType.CV_64FC1);
+                        Mat tvec1Mat = new Mat(3, 1, MatType.CV_64FC1);
+                        Mat rvec2Mat = new Mat(3, 1, MatType.CV_64FC1);
+                        Mat tvec2Mat = new Mat(3, 1, MatType.CV_64FC1);
 
-                    Cv2.SolvePnP(objectPointsMat, imagePoints1Mat, cameraMatrix1Mat, distCoeffs1Mat, rvec1Mat, tvec1Mat);
-                    Cv2.SolvePnP(objectPointsMat, imagePoints2Mat, cameraMatrix2Mat, distCoeffs2Mat, rvec2Mat, tvec2Mat);
+                        Cv2.SolvePnP(objectPointsMat, imagePoints1Mat, cameraMatrix1Mat, distCoeffs1Mat, rvec1Mat, tvec1Mat);
+                        Cv2.SolvePnP(objectPointsMat, imagePoints2Mat, cameraMatrix2Mat, distCoeffs2Mat, rvec2Mat, tvec2Mat);
 
                     // Извлечение данных из Mat в double[]
                     for (int i = 0; i < 3; i++)
@@ -912,7 +702,12 @@ namespace StereoCalibration
                     Debug.WriteLine($"tvec1: X {tvec1[0]:F2}, Y {tvec1[1]:F2}, Z {tvec1[2]:F2}");
                     Debug.WriteLine($"tvec2: X {tvec2[0]:F2}, Y {tvec2[1]:F2}, Z {tvec2[2]:F2}");
 
-                    Debug.WriteLine($"Ошибка калибровки (мм): X {dx:F2}, Y {dy:F2}, Z {dz:F2}, Общая: {error:F2}");
+                        Debug.WriteLine($"Ошибка калибровки (мм): X {dx:F2}, Y {dy:F2}, Z {dz:F2}, Общая: {error:F2}");
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"ОШИБКА В SOLVEPNP: {ex.Message}");
+                    }
                 }
             }
             else
@@ -928,6 +723,12 @@ namespace StereoCalibration
                                             calibrationResult.T[2] * calibrationResult.T[2]);
                 Debug.WriteLine($"Расстояние между камерами: {distance} mm");
                 distancePrintCount++;
+            }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"КРИТИЧЕСКАЯ ОШИБКА В PROCESSFRAME: {ex.Message}");
+                Debug.WriteLine($"Stack trace: {ex.StackTrace}");
             }
         }
         private void CapturePairButton_Click(object sender, EventArgs e)
@@ -1151,21 +952,22 @@ namespace StereoCalibration
             Mat E = new Mat();
             Mat F = new Mat();
 
-            var tvecs1 = new Vec3d[10];
-            var tvecs2 = new Vec3d[10];
-            var rvecs1 = new Vec3d[10];
-            var rvecs2 = new Vec3d[10];
-            //print_mat(pairObjectPointsList[0]);
-            //print_mat(pairImagePointsList1[0]);
-            /* var cameraMatrix1_double =(double[,]) to_double(cameraMatrix1);
-             var cameraMatrix2_double = (double[,])to_double(cameraMatrix2);
-
-
-             var distCoeffs1_double = (double[])to_double(distCoeffs1);
-             var distCoeffs2_double = (double[])to_double(distCoeffs2);*/
+            var tvecs1 = new Vec3d[ps_3d_all.Count];
+            var tvecs2 = new Vec3d[ps_3d_all.Count];
+            var rvecs1 = new Vec3d[ps_3d_all.Count];
+            var rvecs2 = new Vec3d[ps_3d_all.Count];
             var image_size = mats1[0].Size();
-            var err1 = Cv2.CalibrateCamera(ps_3d_all, ps_2d_all_1, image_size, cameraMatrix1, distCoeffs1, out rvecs1, out tvecs1, CalibrationFlags.None, new TermCriteria(CriteriaTypes.Count, 100, 0.1));
-            var err2 = Cv2.CalibrateCamera(ps_3d_all, ps_2d_all_2, image_size, cameraMatrix2, distCoeffs2, out rvecs2, out tvecs2, CalibrationFlags.None, new TermCriteria(CriteriaTypes.Count, 100, 0.1));
+            var err1 = Cv2.CalibrateCamera(ps_3d_all, ps_2d_all_1, image_size, cameraMatrix1, distCoeffs1, out rvecs1, out tvecs1, CalibrationFlags.None, new TermCriteria(CriteriaTypes.Eps | CriteriaTypes.MaxIter, 100, 1e-6));
+            var err2 = Cv2.CalibrateCamera(ps_3d_all, ps_2d_all_2, image_size, cameraMatrix2, distCoeffs2, out rvecs2, out tvecs2, CalibrationFlags.None, new TermCriteria(CriteriaTypes.Eps | CriteriaTypes.MaxIter, 100, 1e-6));
+            
+            Debug.WriteLine("Ошибки индивидуальной калибровки: " + err1 + " " + err2);
+            
+            // Проверяем качество индивидуальной калибровки
+            if (err1 > 1.0 || err2 > 1.0)
+            {
+                MessageBox.Show($"Предупреждение: Высокая ошибка индивидуальной калибровки. Камера 1: {err1:F3}, Камера 2: {err2:F3}");
+            }
+            
             print_double(cameraMatrix1);
             print_double(distCoeffs1);
             print_double(cameraMatrix2);
@@ -1184,9 +986,16 @@ namespace StereoCalibration
                     ps_3d_all,
                     ps_2d_all_1,
                     ps_2d_all_2,
-                    cameraMatrix1, distCoeffs1, cameraMatrix2, distCoeffs2,
-                    new OpenCvSharp.Size(640, 480), R, T, E, F,
-                    CalibrationFlags.RationalModel
+                    cameraMatrix1, 
+                    distCoeffs1, 
+                    cameraMatrix2, 
+                    distCoeffs2,
+                    image_size,
+                     R, 
+                     T,
+                      E, 
+                      F,
+                    CalibrationFlags.FixIntrinsic
                 );
 
                 // Преобразование Mat в массивы
@@ -1207,7 +1016,22 @@ namespace StereoCalibration
                 string json = JsonConvert.SerializeObject(result, Formatting.Indented);
                 File.WriteAllText("calibration_result.json", json);
 
-                MessageBox.Show($"Калибровка успешна! Ошибка: {error}\nРезультаты сохранены в calibration_result.json");
+                // Дополнительная диагностика
+                Debug.WriteLine($"Стереокалибровка завершена. Ошибка: {error:F6}");
+                Debug.WriteLine($"Расстояние между камерами: {Math.Sqrt(result.T[0]*result.T[0] + result.T[1]*result.T[1] + result.T[2]*result.T[2]):F2} мм");
+                
+                // Проверка качества результатов
+                string qualityMessage = "";
+                if (error < 0.5)
+                    qualityMessage = " (Отличное качество)";
+                else if (error < 1.0)
+                    qualityMessage = " (Хорошее качество)";
+                else if (error < 2.0)
+                    qualityMessage = " (Удовлетворительное качество)";
+                else
+                    qualityMessage = " (Плохое качество - рекомендуется перекалибровка)";
+
+                MessageBox.Show($"Калибровка успешна! Ошибка: {error:F3}{qualityMessage}\nРезультаты сохранены в calibration_result.json");
             }
             catch (OpenCvSharp.OpenCVException ex)
             {
@@ -1222,39 +1046,10 @@ namespace StereoCalibration
             {
                 for (var colIndex = 0; colIndex < mat.Cols; colIndex++)
                 {
-                    try
-                    {
-                        if (mat.Type() == MatType.CV_64FC1)
-                        {
-                            Console.Write($"{mat.At<double>(rowIndex, colIndex):F4} ");
-                        }
-                        else if (mat.Type() == MatType.CV_32FC1)
-                        {
-                            Console.Write($"{mat.At<float>(rowIndex, colIndex):F4} ");
-                        }
-                        else if (mat.Type() == MatType.CV_32FC2)
-                        {
-                            var vec = mat.At<Vec2f>(rowIndex, colIndex);
-                            Console.Write($"({vec.Item0:F2}, {vec.Item1:F2}) ");
-                        }
-                        else if (mat.Type() == MatType.CV_32FC3)
-                        {
-                            var vec = mat.At<Vec3f>(rowIndex, colIndex);
-                            Console.Write($"({vec.Item0:F2}, {vec.Item1:F2}, {vec.Item2:F2}) ");
-                        }
-                        else
-                {
                     Console.Write($"{mat.At<double>(rowIndex, colIndex)} ");
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.Write("ERROR ");
-                    }
                 }
                 Console.WriteLine("");
             }
-            Console.WriteLine("----------------------------------");
         }
         void print_double(double[,] mat)
         {
@@ -1309,61 +1104,7 @@ namespace StereoCalibration
 
         }
 
-        private void DrawReprojectionError(Mat image, Point2f original, Point2f reprojected, string text)
-        {
-            // Рисуем оригинальную и репроецированную точки
-            Cv2.Circle(image, new OpenCvSharp.Point(original.X, original.Y), 3, new Scalar(0, 255, 0), -1); // Оригинальная точка (зеленым)
-            Cv2.Circle(image, new OpenCvSharp.Point(reprojected.X, reprojected.Y), 3, new Scalar(0, 0, 255), -1); // Репроецированная точка (красным)
-            
-            // Рисуем линию между ними
-            Cv2.Line(image, new OpenCvSharp.Point(original.X, original.Y), new OpenCvSharp.Point(reprojected.X, reprojected.Y), 
-                new Scalar(255, 0, 0), 1, LineTypes.AntiAlias);
-            
-            // Отображаем текст о репроекционной ошибке
-            if (!string.IsNullOrEmpty(text))
-            {
-                Cv2.PutText(image, text, new OpenCvSharp.Point(original.X + 5, original.Y - 5), 
-                    HersheyFonts.HersheySimplex, 0.4, new Scalar(255, 255, 0), 1);
-            }
-        }
 
-        // Метод для фильтрации расстояния с использованием скользящего среднего
-        private double GetFilteredDistance(int markerId, double newDistance)
-        {
-            // Инициализация истории для нового маркера
-            if (!markerDistanceHistory.ContainsKey(markerId))
-            {
-                markerDistanceHistory[markerId] = new List<double>();
-            }
-            
-            var history = markerDistanceHistory[markerId];
-            
-            // Добавляем новое значение в историю
-            history.Add(newDistance);
-            
-            // Ограничиваем размер истории
-            if (history.Count > MAX_HISTORY_SIZE)
-            {
-                history.RemoveAt(0);
-            }
-            
-            // Проверка на выбросы (значения, сильно отличающиеся от предыдущих)
-            if (history.Count > 1)
-            {
-                double prevAvg = history.Take(history.Count - 1).Average();
-                double diff = Math.Abs(newDistance - prevAvg);
-                
-                // Если разница более 20%, считаем это выбросом и игнорируем
-                if (diff > prevAvg * 0.2)
-                {
-                    history.RemoveAt(history.Count - 1); // Удаляем выброс
-                    return prevAvg; // Возвращаем предыдущее среднее
-                }
-            }
-            
-            // Вычисляем среднее значение из истории
-            return history.Average();
-        }
     }
 
     public class CalibrationResult
