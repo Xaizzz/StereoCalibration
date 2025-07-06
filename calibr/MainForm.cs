@@ -21,7 +21,7 @@ namespace StereoCalibration
         private List<Mat> pairImagePointsList1, pairImagePointsList2;
         private List<Mat> pairObjectPointsList;
         private OpenCvSharp.Size patternSize = new OpenCvSharp.Size(9, 6); // Размер шахматной доски (10x7)
-        private const float squareSize = 8f; // Размер квадрата на доске в мм
+        private const float squareSize = 8.5f; // Размер квадрата на доске в мм
 
         private System.Windows.Forms.Button StartButton;
         private System.Windows.Forms.Button OpenImagesButton;
@@ -277,7 +277,10 @@ namespace StereoCalibration
                     CvAruco.DrawDetectedMarkers(fr2, cornersAruco2, idsAruco2);
                 }
 
-                // Триангуляция ArUco маркеров (только если калибровка загружена)
+                // ═══════════════════════════════════════════════════════════════════════════════════════
+                // ТРИАНГУЛЯЦИЯ ArUco МАРКЕРОВ - ОПРЕДЕЛЕНИЕ 3D КООРДИНАТ ИЗ СТЕРЕО ИЗОБРАЖЕНИЙ
+                // ═══════════════════════════════════════════════════════════════════════════════════════
+                // Триангуляция работает только при наличии калибровочных данных и обнаруженных маркеров
                 if (calibrationResult != null && idsAruco1.Length > 0 && idsAruco2.Length > 0)
                 {
                     try
@@ -285,189 +288,274 @@ namespace StereoCalibration
                         Debug.WriteLine($"=== НАЧАЛО ТРИАНГУЛЯЦИИ ===");
                         Debug.WriteLine($"Найдено маркеров: камера 1 - {idsAruco1.Length}, камера 2 - {idsAruco2.Length}");
                     
-                    // Сопоставление маркеров по ID
-                    Dictionary<int, (Point2f[] left, Point2f[] right)> matchedMarkers = new Dictionary<int, (Point2f[], Point2f[])>();
-                    for (int i = 0; i < idsAruco1.Length; i++)
-                    {
-                        for (int j = 0; j < idsAruco2.Length; j++)
+                        // ═══════════════════════════════════════════════════════════════════════════════════
+                        // ЭТАП 1: СОПОСТАВЛЕНИЕ МАРКЕРОВ ПО ID МЕЖДУ ДВУМЯ КАМЕРАМИ
+                        // ═══════════════════════════════════════════════════════════════════════════════════
+                        // Для триангуляции нужны одинаковые маркеры, видимые обеими камерами
+                        Dictionary<int, (Point2f[] left, Point2f[] right)> matchedMarkers = new Dictionary<int, (Point2f[], Point2f[])>();
+                        for (int i = 0; i < idsAruco1.Length; i++)
                         {
-                            if (idsAruco1[i] == idsAruco2[j])
+                            for (int j = 0; j < idsAruco2.Length; j++)
                             {
-                                matchedMarkers[idsAruco1[i]] = (cornersAruco1[i], cornersAruco2[j]);
-                                Debug.WriteLine($"Найдено совпадение маркера ID {idsAruco1[i]}");
-                                break;
+                                if (idsAruco1[i] == idsAruco2[j])
+                                {
+                                    // Сохраняем пары: ID маркера -> (углы на левом кадре, углы на правом кадре)
+                                    matchedMarkers[idsAruco1[i]] = (cornersAruco1[i], cornersAruco2[j]);
+                                    Debug.WriteLine($"Найдено совпадение маркера ID {idsAruco1[i]}");
+                                    break;
+                                }
                             }
                         }
-                    }
 
-                    Debug.WriteLine($"Сопоставленных маркеров: {matchedMarkers.Count}");
+                        Debug.WriteLine($"Сопоставленных маркеров: {matchedMarkers.Count}");
 
-                    // Создаем матрицы камер один раз (они одинаковые для всех маркеров)
-                    Mat cameraMatrix1Mat = new Mat(3, 3, MatType.CV_64FC1);
-                    Mat cameraMatrix2Mat = new Mat(3, 3, MatType.CV_64FC1);
-                    Mat distCoeffs1Mat = new Mat(1, 5, MatType.CV_64FC1);
-                    Mat distCoeffs2Mat = new Mat(1, 5, MatType.CV_64FC1);
+                        // ═══════════════════════════════════════════════════════════════════════════════════
+                        // ЭТАП 2: ПОДГОТОВКА КАЛИБРОВОЧНЫХ МАТРИЦ
+                        // ═══════════════════════════════════════════════════════════════════════════════════
+                        // Создаем OpenCV матрицы из калибровочных данных для каждой камеры
+                        Mat cameraMatrix1Mat = new Mat(3, 3, MatType.CV_64FC1);  // Внутренние параметры камеры 1 (K1)
+                        Mat cameraMatrix2Mat = new Mat(3, 3, MatType.CV_64FC1);  // Внутренние параметры камеры 2 (K2)
+                        Mat distCoeffs1Mat = new Mat(1, 5, MatType.CV_64FC1);    // Коэффициенты искажения камеры 1
+                        Mat distCoeffs2Mat = new Mat(1, 5, MatType.CV_64FC1);    // Коэффициенты искажения камеры 2
 
-                    // Заполняем матрицы калибровки
-                    for (int i = 0; i < 3; i++)
-                    {
-                        for (int j = 0; j < 3; j++)
-                        {
-                            cameraMatrix1Mat.Set(i, j, calibrationResult.CameraMatrix1[i, j]);
-                            cameraMatrix2Mat.Set(i, j, calibrationResult.CameraMatrix2[i, j]);
-                        }
-                    }
-                    for (int i = 0; i < 5; i++)
-                    {
-                        distCoeffs1Mat.Set(0, i, calibrationResult.DistCoeffs1[i]);
-                        distCoeffs2Mat.Set(0, i, calibrationResult.DistCoeffs2[i]);
-                    }
-
-                    Debug.WriteLine("Матрицы камер созданы");
-
-                    // Триангуляция для каждого маркера
-                    foreach (var marker in matchedMarkers)
-                    {
-                        int id = marker.Key;
-                        Point2f[] leftCorners = marker.Value.left;
-                        Point2f[] rightCorners = marker.Value.right;
-
-                        Debug.WriteLine($"--- Обработка маркера ID {id} ---");
-
-                        // Вычисляем центр маркера
-                        Point2f leftCenter = new Point2f(
-                            (leftCorners[0].X + leftCorners[1].X + leftCorners[2].X + leftCorners[3].X) / 4,
-                            (leftCorners[0].Y + leftCorners[1].Y + leftCorners[2].Y + leftCorners[3].Y) / 4
-                        );
-                        Point2f rightCenter = new Point2f(
-                            (rightCorners[0].X + rightCorners[1].X + rightCorners[2].X + rightCorners[3].X) / 4,
-                            (rightCorners[0].Y + rightCorners[1].Y + rightCorners[2].Y + rightCorners[3].Y) / 4
-                        );
-
-                        Debug.WriteLine($"Центры маркера: левый ({leftCenter.X:F2}, {leftCenter.Y:F2}), правый ({rightCenter.X:F2}, {rightCenter.Y:F2})");
-
-                        // Исправляем искажения точек
-                        Point2f[] leftCenterArray = new Point2f[] { leftCenter };
-                        Point2f[] rightCenterArray = new Point2f[] { rightCenter };
-                        
-                        Mat leftPointsMat = InputArray.Create(leftCenterArray).GetMat();
-                        Mat rightPointsMat = InputArray.Create(rightCenterArray).GetMat();
-                        Mat undistortedLeft = new Mat();
-                        Mat undistortedRight = new Mat();
-
-                        // Убираем искажения без ректификации
-                        Cv2.UndistortPoints(leftPointsMat, undistortedLeft, cameraMatrix1Mat, distCoeffs1Mat, null, cameraMatrix1Mat);
-                        Cv2.UndistortPoints(rightPointsMat, undistortedRight, cameraMatrix2Mat, distCoeffs2Mat, null, cameraMatrix2Mat);
-
-                        // Получаем исправленные точки
-                        Point2f leftUndistorted = undistortedLeft.At<Point2f>(0, 0);
-                        Point2f rightUndistorted = undistortedRight.At<Point2f>(0, 0);
-
-                        Debug.WriteLine($"Исправленные центры: левый ({leftUndistorted.X:F2}, {leftUndistorted.Y:F2}), правый ({rightUndistorted.X:F2}, {rightUndistorted.Y:F2})");
-
-                        // Создаем проекционные матрицы P1 = K1[I|0] и P2 = K2[R|T]
-                        Mat P1 = new Mat(3, 4, MatType.CV_64FC1);
-                        Mat P2 = new Mat(3, 4, MatType.CV_64FC1);
-
-                        // P1 = K1[I|0] - камера 1 в начале координат
+                        // Заполняем матрицы внутренних параметров K1 и K2
+                        // K = [fx  0  cx]  где fx,fy - фокусные расстояния, cx,cy - центр изображения
+                        //     [ 0 fy  cy]
+                        //     [ 0  0   1]
                         for (int i = 0; i < 3; i++)
                         {
                             for (int j = 0; j < 3; j++)
                             {
-                                P1.Set(i, j, calibrationResult.CameraMatrix1[i, j]);
+                                cameraMatrix1Mat.Set(i, j, calibrationResult.CameraMatrix1[i, j]);
+                                cameraMatrix2Mat.Set(i, j, calibrationResult.CameraMatrix2[i, j]);
                             }
-                            P1.Set(i, 3, 0.0);
+                        }
+                        
+                        // Заполняем коэффициенты радиальных и тангенциальных искажений
+                        // [k1, k2, p1, p2, k3] - стандартная модель искажений OpenCV
+                        for (int i = 0; i < 5; i++)
+                        {
+                            distCoeffs1Mat.Set(0, i, calibrationResult.DistCoeffs1[i]);
+                            distCoeffs2Mat.Set(0, i, calibrationResult.DistCoeffs2[i]);
                         }
 
-                        // P2 = K2[R|T] - камера 2 в стерео системе
-                        // Сначала создаем [R|T]
-                        Mat RT = new Mat(3, 4, MatType.CV_64FC1);
+                        // ═══════════════════════════════════════════════════════════════════════════════════
+                        // ЭТАП 3: ПОДГОТОВКА СТЕРЕО ПАРАМЕТРОВ
+                        // ═══════════════════════════════════════════════════════════════════════════════════
+                        // R и T описывают взаимное расположение камер в стерео системе
+                        Mat R_stereo = new Mat(3, 3, MatType.CV_64FC1);  // Матрица поворота между камерами
+                        Mat T_stereo = new Mat(3, 1, MatType.CV_64FC1);  // Вектор трансляции между камерами
+                        
                         for (int i = 0; i < 3; i++)
                         {
                             for (int j = 0; j < 3; j++)
                             {
-                                RT.Set(i, j, calibrationResult.R[i, j]);
+                                R_stereo.Set(i, j, calibrationResult.R[i, j]);
                             }
-                            RT.Set(i, 3, calibrationResult.T[i]);
+                            T_stereo.Set(i, 0, calibrationResult.T[i]);  // T в миллиметрах
                         }
 
-                        // P2 = K2 * [R|T]
-                        P2 = cameraMatrix2Mat * RT;
+                        Debug.WriteLine("Матрицы камер и стерео параметры созданы");
 
-                        Debug.WriteLine("Проекционные матрицы созданы");
-                        Debug.WriteLine($"P1 размер: {P1.Rows}x{P1.Cols}, P2 размер: {P2.Rows}x{P2.Cols}");
-
-                        // Триангуляция - используем исправленные точки
-                        Mat points4D = new Mat();
-                        Point2d[] leftPoints = new Point2d[] { new Point2d(leftUndistorted.X, leftUndistorted.Y) };
-                        Point2d[] rightPoints = new Point2d[] { new Point2d(rightUndistorted.X, rightUndistorted.Y) };
-                        
-                        Cv2.TriangulatePoints(P1, P2, 
-                            InputArray.Create(leftPoints), 
-                            InputArray.Create(rightPoints), 
-                            points4D);
-
-                        Debug.WriteLine($"Результат триангуляции размер: {points4D.Rows}x{points4D.Cols}");
-
-                        // Преобразование из гомогенных координат
-                        double x = points4D.At<double>(0, 0);
-                        double y = points4D.At<double>(1, 0);
-                        double z = points4D.At<double>(2, 0);
-                        double w = points4D.At<double>(3, 0);
-
-                        Debug.WriteLine($"Гомогенные координаты: ({x:F6}, {y:F6}, {z:F6}, {w:F6})");
-
-                        if (Math.Abs(w) > 1e-7)
+                        // ═══════════════════════════════════════════════════════════════════════════════════
+                        // ЭТАП 4: ТРИАНГУЛЯЦИЯ КАЖДОГО СОПОСТАВЛЕННОГО МАРКЕРА
+                        // ═══════════════════════════════════════════════════════════════════════════════════
+                        foreach (var marker in matchedMarkers)
                         {
-                            x /= w;
-                            y /= w;
-                            z /= w;
+                            int id = marker.Key;
+                            Point2f[] leftCorners = marker.Value.left;   // 4 угла маркера на левом изображении
+                            Point2f[] rightCorners = marker.Value.right; // 4 угла маркера на правом изображении
 
-                            Debug.WriteLine($"3D координаты в мм: ({x:F2}, {y:F2}, {z:F2})");
+                            Debug.WriteLine($"--- Обработка маркера ID {id} ---");
 
-                            double distance = Math.Sqrt(x * x + y * y + z * z);
-                            double distanceCm = distance / 10.0; // в см
+                            // ═══════════════════════════════════════════════════════════════════════════════
+                            // ЭТАП 4.1: ВЫЧИСЛЕНИЕ ЦЕНТРА МАРКЕРА
+                            // ═══════════════════════════════════════════════════════════════════════════════
+                            // ArUco маркер имеет 4 угла, вычисляем геометрический центр
+                            // Это более точно, чем использование одного угла
+                            Point2f leftCenter = new Point2f(
+                                (leftCorners[0].X + leftCorners[1].X + leftCorners[2].X + leftCorners[3].X) / 4.0f,
+                                (leftCorners[0].Y + leftCorners[1].Y + leftCorners[2].Y + leftCorners[3].Y) / 4.0f
+                            );
+                            Point2f rightCenter = new Point2f(
+                                (rightCorners[0].X + rightCorners[1].X + rightCorners[2].X + rightCorners[3].X) / 4.0f,
+                                (rightCorners[0].Y + rightCorners[1].Y + rightCorners[2].Y + rightCorners[3].Y) / 4.0f
+                            );
 
-                            Debug.WriteLine($"Расстояние: {distance:F2} мм = {distanceCm:F1} см");
+                            Debug.WriteLine($"Центры маркера: левый ({leftCenter.X:F4}, {leftCenter.Y:F4}), правый ({rightCenter.X:F4}, {rightCenter.Y:F4})");
 
-                            // Проверка разумности результата
-                            if (distance > 50 && distance < 5000) // от 5 см до 5 метров
+                            // ═══════════════════════════════════════════════════════════════════════════════
+                            // ЭТАП 4.2: ИСПРАВЛЕНИЕ ИСКАЖЕНИЙ ЛИНЗ
+                            // ═══════════════════════════════════════════════════════════════════════════════
+                            // Реальные линзы имеют радиальные и тангенциальные искажения
+                            // UndistortPoints преобразует искаженные координаты в идеальные (нормализованные)
+                            Point2f[] leftCenterArray = new Point2f[] { leftCenter };
+                            Point2f[] rightCenterArray = new Point2f[] { rightCenter };
+                            
+                            Mat leftPointsMat = InputArray.Create(leftCenterArray).GetMat();
+                            Mat rightPointsMat = InputArray.Create(rightCenterArray).GetMat();
+                            Mat undistortedLeft = new Mat();
+                            Mat undistortedRight = new Mat();
+
+                            // UndistortPoints без третьего параметра возвращает нормализованные координаты:
+                            // - Исправляет искажения линз
+                            // - Переводит в систему координат камеры (метрические координаты)
+                            // - Результат: x' = (x - cx)/fx, y' = (y - cy)/fy после исправления искажений
+                            Cv2.UndistortPoints(leftPointsMat, undistortedLeft, cameraMatrix1Mat, distCoeffs1Mat);
+                            Cv2.UndistortPoints(rightPointsMat, undistortedRight, cameraMatrix2Mat, distCoeffs2Mat);
+
+                            // Извлекаем нормализованные координаты
+                            Point2f leftNormalized = undistortedLeft.At<Point2f>(0, 0);
+                            Point2f rightNormalized = undistortedRight.At<Point2f>(0, 0);
+
+                            Debug.WriteLine($"Нормализованные координаты: левый ({leftNormalized.X:F6}, {leftNormalized.Y:F6}), правый ({rightNormalized.X:F6}, {rightNormalized.Y:F6})");
+
+                            // ═══════════════════════════════════════════════════════════════════════════════
+                            // ЭТАП 4.3: СОЗДАНИЕ ПРОЕКЦИОННЫХ МАТРИЦ ДЛЯ СТЕРЕО СИСТЕМЫ
+                            // ═══════════════════════════════════════════════════════════════════════════════
+                            // Проекционная матрица P связывает 3D точки мира с 2D точками изображения: x = P*X
+                            // Для нормализованных координат используем упрощенные матрицы
+                            
+                            // P1 = [I|0] - камера 1 в начале системы координат (эталонная)
+                            // I - единичная матрица 3x3, 0 - нулевой вектор трансляции
+                            Mat P1 = new Mat(3, 4, MatType.CV_64FC1);
+                            for (int i = 0; i < 3; i++)
                             {
-                                // Отображение расстояния
-                                Cv2.PutText(fr1,
-                                    $"ID {id}: {distanceCm:F1}cm",
-                                    new OpenCvSharp.Point((int)leftCenter.X, (int)leftCenter.Y - 10),
-                                    HersheyFonts.HersheySimplex,
-                                    0.6,
-                                    Scalar.Red,
-                                    2);
+                                for (int j = 0; j < 3; j++)
+                                {
+                                    P1.Set(i, j, i == j ? 1.0 : 0.0); // Единичная матрица для нормализованных координат
+                                }
+                                P1.Set(i, 3, 0.0); // Нулевая трансляция
+                            }
 
-                                Cv2.PutText(fr2,
-                                    $"ID {id}: {distanceCm:F1}cm",
-                                    new OpenCvSharp.Point((int)rightCenter.X, (int)rightCenter.Y - 10),
-                                    HersheyFonts.HersheySimplex,
-                                    0.6,
-                                    Scalar.Red,
-                                    2);
+                            // P2 = [R|T] - камера 2 относительно камеры 1
+                            // R - поворот камеры 2 относительно камеры 1
+                            // T - позиция камеры 2 относительно камеры 1 (в мм)
+                            Mat P2 = new Mat(3, 4, MatType.CV_64FC1);
+                            for (int i = 0; i < 3; i++)
+                            {
+                                for (int j = 0; j < 3; j++)
+                                {
+                                    P2.Set(i, j, calibrationResult.R[i, j]);
+                                }
+                                P2.Set(i, 3, calibrationResult.T[i]); // Трансляция в мм
+                            }
 
-                                Debug.WriteLine($"*** РЕЗУЛЬТАТ: Маркер {id} на расстоянии {distanceCm:F1} см ***");
+                            Debug.WriteLine("Проекционные матрицы для нормализованных координат созданы");
+
+                            // ═══════════════════════════════════════════════════════════════════════════════
+                            // ЭТАП 4.4: ТРИАНГУЛЯЦИЯ - ВОССТАНОВЛЕНИЕ 3D КООРДИНАТ
+                            // ═══════════════════════════════════════════════════════════════════════════════
+                            // TriangulatePoints решает систему линейных уравнений для нахождения 3D точки,
+                            // которая проецируется в заданные 2D точки на обоих изображениях
+                            Mat points4D = new Mat();
+                            Point2d[] leftPoints = new Point2d[] { new Point2d(leftNormalized.X, leftNormalized.Y) };
+                            Point2d[] rightPoints = new Point2d[] { new Point2d(rightNormalized.X, rightNormalized.Y) };
+                            
+                            // Алгоритм DLT (Direct Linear Transform):
+                            // Для каждой камеры: x_i = P_i * X, где X - искомая 3D точка
+                            // Решается система: A * X = 0 методом SVD
+                            Cv2.TriangulatePoints(P1, P2, 
+                                InputArray.Create(leftPoints), 
+                                InputArray.Create(rightPoints), 
+                                points4D);
+
+                            Debug.WriteLine($"Результат триангуляции размер: {points4D.Rows}x{points4D.Cols}");
+
+                            // ═══════════════════════════════════════════════════════════════════════════════
+                            // ЭТАП 4.5: ПРЕОБРАЗОВАНИЕ ИЗ ГОМОГЕННЫХ КООРДИНАТ В ДЕКАРТОВЫ
+                            // ═══════════════════════════════════════════════════════════════════════════════
+                            // Результат триангуляции - гомогенные координаты [X, Y, Z, W]
+                            // Декартовы координаты: x = X/W, y = Y/W, z = Z/W
+                            double x = points4D.At<double>(0, 0);
+                            double y = points4D.At<double>(1, 0);
+                            double z = points4D.At<double>(2, 0);
+                            double w = points4D.At<double>(3, 0);
+
+                            Debug.WriteLine($"Гомогенные координаты: ({x:F8}, {y:F8}, {z:F8}, {w:F8})");
+
+                            // Проверяем корректность гомогенной координаты W (не должна быть близка к нулю)
+                            if (Math.Abs(w) > 1e-10)
+                            {
+                                // Нормализация: переход к декартовым координатам
+                                x /= w;
+                                y /= w;
+                                z /= w;
+
+                                // ═══════════════════════════════════════════════════════════════════════════
+                                // ЭТАП 4.6: ВЫЧИСЛЕНИЕ РАССТОЯНИЯ И ВЫВОД РЕЗУЛЬТАТОВ
+                                // ═══════════════════════════════════════════════════════════════════════════
+                                // Координаты уже в миллиметрах благодаря калибровке с squareSize в мм
+                                Debug.WriteLine($"3D координаты в мм: ({x:F4}, {y:F4}, {z:F4})");
+
+                                // Евклидово расстояние от камеры 1 до маркера
+                                double distance = Math.Sqrt(x * x + y * y + z * z);
+
+                                Debug.WriteLine($"Точное расстояние: {distance:F4} мм");
+
+                                // Фильтрация нереалистичных результатов (от 1 см до 10 метров)
+                                if (distance > 10 && distance < 10000)
+                                {
+                                    // Отображение результатов на изображениях
+                                    Cv2.PutText(fr1,
+                                        $"ID {id}: {distance:F1}mm",
+                                        new OpenCvSharp.Point((int)leftCenter.X, (int)leftCenter.Y - 10),
+                                        HersheyFonts.HersheySimplex,
+                                        0.7,
+                                        Scalar.Red,
+                                        2);
+
+                                    Cv2.PutText(fr2,
+                                        $"ID {id}: {distance:F1}mm",
+                                        new OpenCvSharp.Point((int)rightCenter.X, (int)rightCenter.Y - 10),
+                                        HersheyFonts.HersheySimplex,
+                                        0.7,
+                                        Scalar.Red,
+                                        2);
+
+                                    // Дополнительная информация о 3D координатах
+                                    Cv2.PutText(fr1,
+                                        $"X:{x:F1} Y:{y:F1} Z:{z:F1}",
+                                        new OpenCvSharp.Point((int)leftCenter.X, (int)leftCenter.Y + 20),
+                                        HersheyFonts.HersheySimplex,
+                                        0.5,
+                                        Scalar.Blue,
+                                        1);
+
+                                    Debug.WriteLine($"*** ТОЧНЫЙ РЕЗУЛЬТАТ: Маркер {id} на расстоянии {distance:F4} мм ***");
+                                    Debug.WriteLine($"*** Координаты: X={x:F4}мм, Y={y:F4}мм, Z={z:F4}мм ***");
+                                }
+                                else
+                                {
+                                    Debug.WriteLine($"ПРЕДУПРЕЖДЕНИЕ: Нереалистичное расстояние {distance:F4} мм для маркера {id}");
+                                }
                             }
                             else
                             {
-                                Debug.WriteLine($"ПРЕДУПРЕЖДЕНИЕ: Нереалистичное расстояние {distance:F2} мм для маркера {id}");
+                                Debug.WriteLine($"ОШИБКА: Деление на ноль в гомогенных координатах для маркера {id} (w={w:F10})");
                             }
+
+                            // Освобождение ресурсов для текущего маркера
+                            leftPointsMat.Dispose();
+                            rightPointsMat.Dispose();
+                            undistortedLeft.Dispose();
+                            undistortedRight.Dispose();
                         }
-                        else
-                        {
-                            Debug.WriteLine($"ОШИБКА: Деление на ноль в гомогенных координатах для маркера {id}");
-                        }
-                    }
-                    
+                        
                         Debug.WriteLine($"=== КОНЕЦ ТРИАНГУЛЯЦИИ ===");
+                        
+                        // Освобождение общих ресурсов
+                        cameraMatrix1Mat.Dispose();
+                        cameraMatrix2Mat.Dispose();
+                        distCoeffs1Mat.Dispose();
+                        distCoeffs2Mat.Dispose();
+                        R_stereo.Dispose();
+                        T_stereo.Dispose();
                     }
                     catch (Exception ex)
                     {
                         Debug.WriteLine($"ОШИБКА В ТРИАНГУЛЯЦИИ: {ex.Message}");
+                        Debug.WriteLine($"Stack trace: {ex.StackTrace}");
                     }
                 }
 
@@ -607,6 +695,7 @@ namespace StereoCalibration
 
                     // Вычисление относительного поворота
                     Mat R_rel = R2 * R1.T();
+                    
 
                     // Преобразование tvec1 и tvec2 в Mat для вычислений
                     tvec1Mat = new Mat(3, 1, MatType.CV_64FC1);
@@ -1018,7 +1107,7 @@ namespace StereoCalibration
 
                 // Дополнительная диагностика
                 Debug.WriteLine($"Стереокалибровка завершена. Ошибка: {error:F6}");
-                Debug.WriteLine($"Расстояние между камерами: {Math.Sqrt(result.T[0]*result.T[0] + result.T[1]*result.T[1] + result.T[2]*result.T[2]):F2} мм");
+                Debug.WriteLine($"Расстояние между камерами: {Math.Sqrt(result.T[0]*result.T[1] + result.T[2]*result.T[2]):F2} мм");
                 
                 // Проверка качества результатов
                 string qualityMessage = "";
