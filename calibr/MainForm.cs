@@ -86,6 +86,16 @@ namespace StereoCalibration
                 {
                     int cam1Index = availableCameras[selectionForm.Camera1Index];
                     int cam2Index = availableCameras[selectionForm.Camera2Index];
+                    
+                    // Добавляем задержку для полного освобождения ресурсов камер
+                    System.Threading.Thread.Sleep(1000);
+                    
+                    // Принудительная сборка мусора для освобождения ресурсов
+                    GC.Collect();
+                    GC.WaitForPendingFinalizers();
+                    GC.Collect();
+                    
+                    Console.WriteLine($"Инициализация камер: {cam1Index}, {cam2Index}");
                     InitializeCamera(cam1Index, cam2Index); // Инициализация с выбранными индексами
                 }
                 else
@@ -173,27 +183,84 @@ namespace StereoCalibration
         private void InitializeCamera(int cam1Index, int cam2Index)
         {
             Debug.WriteLine("init start");
-            capture1 = new VideoCapture(cam1Index);
-            capture2 = new VideoCapture(cam2Index);
-            if (!capture1.IsOpened())
+            
+            try
             {
-                MessageBox.Show($"Не удалось открыть камеру 1 (индекс {cam1Index}).");
-                return;
+                // Освобождаем предыдущие камеры если есть
+                if (capture1 != null)
+                {
+                    capture1.Release();
+                    capture1.Dispose();
+                    capture1 = null;
+                }
+                if (capture2 != null)
+                {
+                    capture2.Release();
+                    capture2.Dispose();
+                    capture2 = null;
+                }
+                
+                // Дополнительная задержка
+                System.Threading.Thread.Sleep(500);
+                
+                capture1 = new VideoCapture(cam1Index);
+                System.Threading.Thread.Sleep(300); // Задержка между инициализацией камер
+                capture2 = new VideoCapture(cam2Index);
+                
+                // Проверяем инициализацию с несколькими попытками
+                for (int i = 0; i < 5; i++)
+                {
+                    if (capture1.IsOpened() && capture2.IsOpened())
+                        break;
+                    System.Threading.Thread.Sleep(200);
+                }
+                
+                if (!capture1.IsOpened())
+                {
+                    MessageBox.Show($"Не удалось открыть камеру 1 (индекс {cam1Index}).");
+                    return;
+                }
+                if (!capture2.IsOpened())
+                {
+                    MessageBox.Show($"Не удалось открыть камеру 2 (индекс {cam2Index}).");
+                    return;
+                }
+                
+                Debug.WriteLine("Cameras opened successfully");
+                
+                capture1.Set(VideoCaptureProperties.FrameWidth, 640);
+                capture1.Set(VideoCaptureProperties.FrameHeight, 480);
+                capture2.Set(VideoCaptureProperties.FrameWidth, 640);
+                capture2.Set(VideoCaptureProperties.FrameHeight, 480);
+                
+                // Тест чтения кадров
+                using (var testFrame1 = new Mat())
+                using (var testFrame2 = new Mat())
+                {
+                    if (!capture1.Read(testFrame1) || testFrame1.Empty())
+                    {
+                        MessageBox.Show($"Камера 1 не передает данные (индекс {cam1Index}).");
+                        return;
+                    }
+                    if (!capture2.Read(testFrame2) || testFrame2.Empty())
+                    {
+                        MessageBox.Show($"Камера 2 не передает данные (индекс {cam2Index}).");
+                        return;
+                    }
+                }
+                
+                frame1 = new Mat();
+                frame2 = new Mat();
+                Directory.CreateDirectory("cam1\\" + cur_folder + "\\");
+                Directory.CreateDirectory("cam2\\" + cur_folder + "\\");
+                
+                Debug.WriteLine("init end - success");
             }
-            if (!capture2.IsOpened())
+            catch (Exception ex)
             {
-                MessageBox.Show($"Не удалось открыть камеру 2 (индекс {cam2Index}).");
-                return;
+                MessageBox.Show($"Ошибка инициализации камер: {ex.Message}");
+                Debug.WriteLine($"init error: {ex.Message}");
             }
-            Debug.WriteLine("init end");
-            capture1.Set(VideoCaptureProperties.FrameWidth, 640);
-            capture1.Set(VideoCaptureProperties.FrameHeight, 480);
-            capture2.Set(VideoCaptureProperties.FrameWidth, 640);
-            capture2.Set(VideoCaptureProperties.FrameHeight, 480);
-            frame1 = new Mat();
-            frame2 = new Mat();
-            Directory.CreateDirectory("cam1\\" + cur_folder + "\\");
-            Directory.CreateDirectory("cam2\\" + cur_folder + "\\");
         }
 
         private void OpenImagesButton_Click(object sender, EventArgs e)
