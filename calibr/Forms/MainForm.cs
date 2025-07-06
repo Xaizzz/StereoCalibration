@@ -28,15 +28,30 @@ namespace StereoCalibration.Forms
         private ToolStripStatusLabel statusLabel;
 
         /// <summary>
+        /// Конструктор по умолчанию
+        /// </summary>
+        public MainForm()
+        {
+            InitializeComponent();
+        }
+
+        /// <summary>
         /// Конструктор формы
         /// </summary>
-        public MainForm(MainFormPresenter presenter, int camera1Id, int camera2Id)
+        public MainForm(MainFormPresenter presenter, int camera1Id, int camera2Id) : this()
+        {
+            SetPresenter(presenter, camera1Id, camera2Id);
+        }
+
+        /// <summary>
+        /// Установка презентера и инициализация
+        /// </summary>
+        public void SetPresenter(MainFormPresenter presenter, int camera1Id, int camera2Id)
         {
             _presenter = presenter ?? throw new ArgumentNullException(nameof(presenter));
             _camera1Id = camera1Id;
             _camera2Id = camera2Id;
             
-            InitializeComponent();
             InitializePresenter();
         }
 

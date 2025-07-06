@@ -40,16 +40,20 @@ namespace StereoCalibration
                     int camera1Id = cameraSelectionForm.Camera1Index;
                     int camera2Id = cameraSelectionForm.Camera2Index;
 
-                    // Создаем главную форму с презентером
+                    // Создаем главную форму
+                    var mainForm = new MainForm();
+
+                    // Создаем презентер для главной формы
                     var mainFormPresenter = new MainFormPresenter(
                         cameraService,
                         calibrationService,
                         arUcoService,
                         triangulationService,
                         fileService,
-                        null);
+                        mainForm);
                     
-                    var mainForm = new MainForm(mainFormPresenter, camera1Id, camera2Id);
+                    // Устанавливаем презентер в форму
+                    mainForm.SetPresenter(mainFormPresenter, camera1Id, camera2Id);
 
                     // Запускаем главную форму
                     Application.Run(mainForm);

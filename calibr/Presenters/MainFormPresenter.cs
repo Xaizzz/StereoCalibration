@@ -192,14 +192,11 @@ namespace StereoCalibration.Presenters
 
                 // Добавляем точки для калибровки
                 var objectPoints = _calibrationService.GenerateObjectPoints(_patternSize, _squareSize);
-                var objectPointsMat = new Mat(objectPoints.Count, 1, MatType.CV_32FC3);
-                objectPointsMat.SetArray(0, 0, objectPoints.ToArray());
+                var objectPointsMat = Mat.FromArray(objectPoints.ToArray());
 
-                var imagePoints1Mat = new Mat(corners1.Length, 1, MatType.CV_32FC2);
-                imagePoints1Mat.SetArray(0, 0, corners1);
+                var imagePoints1Mat = Mat.FromArray(corners1);
 
-                var imagePoints2Mat = new Mat(corners2.Length, 1, MatType.CV_32FC2);
-                imagePoints2Mat.SetArray(0, 0, corners2);
+                var imagePoints2Mat = Mat.FromArray(corners2);
 
                 _objectPointsList.Add(objectPointsMat);
                 _imagePointsList1.Add(imagePoints1Mat);

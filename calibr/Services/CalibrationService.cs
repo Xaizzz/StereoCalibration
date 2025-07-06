@@ -53,9 +53,9 @@ namespace StereoCalibration.Services
 
                                          // Выполнение стерео калибровки
                      double error = Cv2.StereoCalibrate(
-                         objectPoints.ToArray(),
-                         imagePoints1.ToArray(),
-                         imagePoints2.ToArray(),
+                         objectPoints.ToArray().Select(m => (InputArray)m).ToArray(),
+                         imagePoints1.ToArray().Select(m => (InputArray)m).ToArray(),
+                         imagePoints2.ToArray().Select(m => (InputArray)m).ToArray(),
                          cameraMatrix1,
                          distCoeffs1,
                          cameraMatrix2,

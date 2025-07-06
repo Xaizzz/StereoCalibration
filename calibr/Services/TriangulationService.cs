@@ -41,19 +41,22 @@ namespace StereoCalibration.Services
                 var R = ArrayToMat(calibrationResult.R);
                 var T = VectorToMat(calibrationResult.T);
 
+                // Создание матриц точек
+                var leftPointsMat = Mat.FromArray(leftPoints.Select(p => new Point2d(p.X, p.Y)).ToArray());
+                var rightPointsMat = Mat.FromArray(rightPoints.Select(p => new Point2d(p.X, p.Y)).ToArray());
+                
                 // Исправление искажений точек
-                var undistortedLeft = new Point2f[leftPoints.Length];
-                var undistortedRight = new Point2f[rightPoints.Length];
+                var undistortedLeftMat = new Mat();
+                var undistortedRightMat = new Mat();
 
-                Cv2.UndistortPoints(leftPoints, undistortedLeft, cameraMatrix1, distCoeffs1);
-                Cv2.UndistortPoints(rightPoints, undistortedRight, cameraMatrix2, distCoeffs2);
+                Cv2.UndistortPoints(leftPointsMat, undistortedLeftMat, cameraMatrix1, distCoeffs1);
+                Cv2.UndistortPoints(rightPointsMat, undistortedRightMat, cameraMatrix2, distCoeffs2);
 
                 // Создание проекционных матриц
-                var P1 = new Mat();
+                var P1 = Mat.Zeros(3, 4, MatType.CV_64FC1);
                 var P2 = new Mat();
 
-                // P1 = [I | 0] для первой камеры
-                Mat.Eye(3, 4, MatType.CV_64FC1).CopyTo(P1);
+                // P1 = [K1 | 0] для первой камеры
                 cameraMatrix1.CopyTo(P1[new Rect(0, 0, 3, 3)]);
 
                 // P2 = K2 * [R | T] для второй камеры
@@ -63,7 +66,7 @@ namespace StereoCalibration.Services
 
                 // Триангуляция
                 var points4D = new Mat();
-                Cv2.TriangulatePoints(P1, P2, undistortedLeft, undistortedRight, points4D);
+                Cv2.TriangulatePoints(P1, P2, undistortedLeftMat, undistortedRightMat, points4D);
 
                 // Преобразование в однородные координаты
                 var result = new List<Point3f>();
@@ -91,6 +94,10 @@ namespace StereoCalibration.Services
                 distCoeffs2.Dispose();
                 R.Dispose();
                 T.Dispose();
+                leftPointsMat.Dispose();
+                rightPointsMat.Dispose();
+                undistortedLeftMat.Dispose();
+                undistortedRightMat.Dispose();
                 P1.Dispose();
                 P2.Dispose();
                 RT.Dispose();
