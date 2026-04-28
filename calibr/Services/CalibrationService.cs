@@ -20,7 +20,7 @@ namespace StereoCalibration.Services
         /// <summary>
         /// Выполнение стерео калибровки
         /// </summary>
-        public async Task<CalibrationResult> PerformStereoCalibrationAsync(
+        public async Task<StereoCalibration.Models.CalibrationResult> PerformStereoCalibrationAsync(
             List<Mat> objectPoints,
             List<Mat> imagePoints1,
             List<Mat> imagePoints2,
@@ -71,7 +71,7 @@ namespace StereoCalibration.Services
                     Debug.WriteLine($"Калибровка завершена. Ошибка: {error}");
 
                     // Создание результата
-                    var result = new CalibrationResult
+                    var result = new StereoCalibration.Models.CalibrationResult
                     {
                         CameraMatrix1 = MatToArray(cameraMatrix1),
                         DistCoeffs1 = MatToVector(distCoeffs1),
@@ -148,7 +148,7 @@ namespace StereoCalibration.Services
         /// <summary>
         /// Сохранение результатов калибровки в JSON файл
         /// </summary>
-        public async Task SaveCalibrationResultAsync(CalibrationResult result, string filePath)
+        public async Task SaveCalibrationResultAsync(StereoCalibration.Models.CalibrationResult result, string filePath)
         {
             if (result == null || string.IsNullOrWhiteSpace(filePath))
                 return;
@@ -179,7 +179,7 @@ namespace StereoCalibration.Services
         /// <summary>
         /// Загрузка результатов калибровки из JSON файла
         /// </summary>
-        public async Task<CalibrationResult> LoadCalibrationResultAsync(string filePath)
+        public async Task<StereoCalibration.Models.CalibrationResult> LoadCalibrationResultAsync(string filePath)
         {
             if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath))
                 return null;
@@ -189,7 +189,7 @@ namespace StereoCalibration.Services
                 return await Task.Run(() =>
                 {
                     var json = File.ReadAllText(filePath);
-                    var result = JsonConvert.DeserializeObject<CalibrationResult>(json);
+                    var result = JsonConvert.DeserializeObject<StereoCalibration.Models.CalibrationResult>(json);
                     
                     Debug.WriteLine($"Результаты калибровки загружены из: {filePath}");
                     return result;

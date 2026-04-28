@@ -20,7 +20,7 @@ namespace StereoCalibration.Services
         public List<Point3f> TriangulatePoints(
             Point2f[] leftPoints,
             Point2f[] rightPoints,
-            CalibrationResult calibrationResult)
+            StereoCalibration.Models.CalibrationResult calibrationResult)
         {
             if (leftPoints == null || rightPoints == null || calibrationResult == null ||
                 leftPoints.Length != rightPoints.Length || leftPoints.Length == 0 ||
