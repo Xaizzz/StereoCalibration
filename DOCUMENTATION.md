@@ -1,7 +1,5 @@
 # Документация проекта StereoCalibration
 
-
-
 Проект написан на C# под `.NET 8 Windows` и объединяет:
 
 - WinForms для основного интерфейса, выбора камер и загрузочного окна.
@@ -127,8 +125,6 @@ flowchart LR
 - `BuildSceneBasis` (`calibr/Services/Scene3DService.cs:329`) строит визуальные оси: X вдоль базовой линии, Y вперёд по общей зоне обзора, Z вверх.
 - `ConvertFromCamera1ToScene` (`calibr/Services/Scene3DService.cs:417`) смещает точку относительно центра стереопары и проецирует её на оси сцены.
 
-
-
 ## Подробный справочник по классам
 
 ### `Program`
@@ -183,8 +179,6 @@ flowchart LR
 - `StartButton_Click` — `calibr/MainForm.cs:712`.
 - `RestartButton_Click` — `calibr/MainForm.cs:760`.
 - `OnFormClosed` — `calibr/MainForm.cs:797`.
-
-
 
 - WinForms UI обновляется через события контроллера.
 - Для 3D используется WPF `Scene3DUserControl`, встроенный через `ElementHost`.
@@ -294,7 +288,6 @@ flowchart LR
 - `RememberedMarker` — `calibr/Services/StereoCameraService.cs:497`.
 - `DetectedMarker` — `calibr/Services/StereoCameraService.cs:514`.
 
-
 - сначала всегда выполняется детект на полном кадре;
 - если маркер пропал, пробуется ROI вокруг прошлого положения;
 - если ROI не помог, маркер кратко удерживается как stale;
@@ -314,8 +307,6 @@ flowchart LR
 - `TriangulateMarker` — `calibr/Services/ImageProcessingService.cs:134`.
 - `CreateMatrixFromArray` — `calibr/Services/ImageProcessingService.cs:247`.
 - `CreateVectorFromArray` — `calibr/Services/ImageProcessingService.cs:263`.
-
-
 
 - маркеры сопоставляются по одинаковому ArUco ID в двух камерах;
 - перед триангуляцией углы проходят `UndistortPoints`;
@@ -341,8 +332,6 @@ flowchart LR
 - `SaveCalibrationResult` — `calibr/Services/StereoCalibrationService.cs:345`.
 - `LoadCalibrationResult` — `calibr/Services/StereoCalibrationService.cs:354`.
 - `CalibrationResult` — `calibr/Services/StereoCalibrationService.cs:372`.
-
-
 
 - калибровка перечитывает пары изображений из `cam1/{folder}` и `cam2/{folder}`;
 - нужно минимум 10 пар с найденной шахматной доской;
