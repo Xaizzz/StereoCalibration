@@ -63,12 +63,14 @@ StereoCalibration/
 │   │   ├── WoundDiagnosticsSessionRecorder.cs, IWoundDiagnosticSink.cs
 │   │   └── …
 │   ├── UI/                    # Scene3DUserControl (WPF)
-│   ├── cam1/, cam2/           # пары кадров для офлайн-калибровки (при использовании)
+│   ├── cam1/, cam2/           # офлайн-калибровка: только локально (в `.gitignore`)
 │   └── calibration_result.json
 └── README.md
 ```
 
 Удалённые из репозитория черновики `ARCHITECTURE_DIAGRAM.md` и `REFACTORING_SUMMARY.md` заменены консолидацией в `TECHNICAL_DESCRIPTION_RU.txt`.
+
+Пары кадров для офлайн-калибровки кладите в `calibr/cam1/<папка>/` и `calibr/cam2/<папка>/` локально — эти каталоги **не версионируются** (`calibr/cam1/`, `calibr/cam2/` в `.gitignore`).
 
 ## Быстрый старт
 
