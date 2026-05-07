@@ -209,22 +209,4 @@ public void SetResolution(int width, int height)
 4. **Отправьте** в ветку (`git push origin feature/AmazingFeature`)
 5. **Откройте Pull Request**
 
-## 📄 Лицензия
 
-Распространяется под лицензией MIT. См. `LICENSE` для подробной информации.
-
-## 👥 Авторы
-
-- **Основной разработчик** - [Ваше Имя](https://github.com/your-username)
-
-## 🙏 Благодарности
-
-- **OpenCV** сообщество за отличную библиотеку компьютерного зрения
-- **Microsoft** за .NET платформу
-- **Сообщество разработчиков** за вдохновение и поддержку
-
----
-
-⭐ **Поставьте звезду, если проект был полезен!**
-
-📧 **Есть вопросы?** Создайте [Issue](https://github.com/your-username/StereoCalibration/issues) или напишите на email.

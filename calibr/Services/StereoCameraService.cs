@@ -191,10 +191,16 @@ namespace StereoCalibration.Services
         /// Перед возвратом применяется fallback: полный кадр, затем ROI вокруг
         /// прошлого положения и только потом краткая память stale-маркера.
         /// </summary>
-        public (Point2f[][]? corners1, Point2f[][]? corners2, int[]? ids1, int[]? ids2) DetectArucoMarkers()
+        public (
+            Point2f[][]? corners1,
+            Point2f[][]? corners2,
+            int[]? ids1,
+            int[]? ids2,
+            IReadOnlyCollection<int> staleIds1,
+            IReadOnlyCollection<int> staleIds2) DetectArucoMarkers()
         {
             if (_frame1 == null || _frame1.Empty() || _frame2 == null || _frame2.Empty())
-                return (null, null, null, null);
+                return (null, null, null, null, Array.Empty<int>(), Array.Empty<int>());
 
             _detectionFrameIndex++;
 
@@ -228,7 +234,13 @@ namespace StereoCalibration.Services
                 }
             }
 
-            return (corners1, corners2, ids1, ids2);
+            return (
+                corners1,
+                corners2,
+                ids1,
+                ids2,
+                new HashSet<int>(_staleMarkerIds1),
+                new HashSet<int>(_staleMarkerIds2));
         }
         
         /// <summary>

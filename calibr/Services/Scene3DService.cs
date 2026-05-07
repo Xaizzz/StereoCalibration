@@ -16,7 +16,8 @@ namespace StereoCalibration.Services
     /// 
     /// Важная особенность: входные координаты маркеров приходят из
     /// <see cref="ImageProcessingService"/> в системе координат первой камеры.
-    /// Перед показом они переводятся в удобный визуальный базис стереопары:
+    /// Сначала они сглаживаются в СК камеры 1 (<see cref="MarkerPositionsCamera1Mm"/>),
+    /// затем переводятся в визуальный базис стереопары для отображения:
     /// X — линия между камерами, Y — общее направление взгляда, Z — вверх.
     /// </summary>
     public class Scene3DService
@@ -40,11 +41,27 @@ namespace StereoCalibration.Services
         /// <summary>Центр стереосистемы</summary>
         public Point3D StereoCenter { get; private set; } = new Point3D(0, 0, 0);
         
-        /// <summary>Текущие позиции ArUco маркеров</summary>
+        /// <summary>Текущие позиции ArUco маркеров в визуальном базисе сцены (мм)</summary>
         public Dictionary<int, Point3D> MarkerPositions { get; private set; } = new Dictionary<int, Point3D>();
+
+        /// <summary>
+        /// Сглаженные позиции маркеров в СК первой камеры (мм), как после триангуляции.
+        /// Используются для деформации модели раны без лишнего переноса в «сцену».
+        /// </summary>
+        public Dictionary<int, Point3D> MarkerPositionsCamera1Mm { get; private set; } = new Dictionary<int, Point3D>();
+
+        /// <summary>
+        /// Сырые позиции маркеров в СК первой камеры (мм) из последнего кадра
+        /// триангуляции, без фильтрации/сглаживания.
+        /// </summary>
+        public Dictionary<int, Point3D> MarkerPositionsCamera1RawMm { get; private set; } = new Dictionary<int, Point3D>();
 
         /// <summary>Стабильные отображаемые номера маркеров: ArUco ID -> номер в UI</summary>
         public Dictionary<int, int> MarkerDisplayIndices { get; private set; } = new Dictionary<int, int>();
+        /// <summary>
+        /// Количество свежих (валидно триангулированных) маркеров в последнем кадре.
+        /// </summary>
+        public int LastTriangulatedFreshMarkerCount { get; private set; }
 
         /// <summary>
         /// Номер последнего кадра, где конкретный ArUco ID был реально триангулирован.
@@ -52,11 +69,8 @@ namespace StereoCalibration.Services
         /// </summary>
         private readonly Dictionary<int, int> _markerLastSeenFrame = new Dictionary<int, int>();
 
-        /// <summary>
-        /// Последние сглаженные позиции. Отдельный словарь нужен, чтобы не смешивать
-        /// сырые измерения из триангуляции и отображаемое положение в сцене.
-        /// </summary>
-        private readonly Dictionary<int, Point3D> _smoothedMarkerPositions = new Dictionary<int, Point3D>();
+        /// <summary>Сглаживание в СК камеры 1 до переноса в визуальный базис.</summary>
+        private readonly Dictionary<int, Point3D> _smoothedMarkerPositionsCamera1 = new Dictionary<int, Point3D>();
         private int _currentFrameIndex = 0;
         /// <summary>
         /// Сколько кадров маркер может отсутствовать в новых измерениях, оставаясь
@@ -70,9 +84,20 @@ namespace StereoCalibration.Services
         private Vector3D _sceneXAxisInCamera1 = new Vector3D(1, 0, 0);
         private Vector3D _sceneYAxisInCamera1 = new Vector3D(0, 0, 1);
         private Vector3D _sceneZAxisInCamera1 = new Vector3D(0, -1, 0);
+        private MatrixTransform3D _camera1ToSceneTransform = new MatrixTransform3D(Matrix3D.Identity);
         
         /// <summary>Флаг готовности калибровки</summary>
         public bool IsCalibrated { get; private set; } = false;
+
+        /// <summary>
+        /// Преобразование из СК камеры 1 в визуальную СК сцены.
+        /// Используется, когда геометрия рассчитывается в camera1-mm, но должна
+        /// отображаться рядом с маркерами сцены в едином базисе.
+        /// </summary>
+        public Transform3D Camera1ToSceneTransform => _camera1ToSceneTransform;
+
+        /// <summary>Копия матрицы Camera1→Scene (WPF <see cref="Matrix3D"/>).</summary>
+        public Matrix3D Camera1ToSceneMatrix => _camera1ToSceneTransform.Value;
         #endregion
 
         /// <summary>
@@ -108,6 +133,7 @@ namespace StereoCalibration.Services
                     camera2InCamera1.Y / 2.0,
                     camera2InCamera1.Z / 2.0
                 );
+                RebuildCamera1ToSceneTransform();
 
                 // Визуальная сцена строится в базисе реальной стереопары:
                 // X - линия между камерами, Y - вперед, Z - вверх.
@@ -122,9 +148,13 @@ namespace StereoCalibration.Services
                     System.Diagnostics.Debug.WriteLine($"Scene3D: Очищаем {MarkerPositions.Count} существующих маркеров для пересчета");
                     MarkerPositions.Clear();
                 }
+
+                MarkerPositionsCamera1Mm.Clear();
+                MarkerPositionsCamera1RawMm.Clear();
                 _markerLastSeenFrame.Clear();
-                _smoothedMarkerPositions.Clear();
+                _smoothedMarkerPositionsCamera1.Clear();
                 _currentFrameIndex = 0;
+                LastTriangulatedFreshMarkerCount = 0;
                 
                 IsCalibrated = true;
                 OnSceneUpdated?.Invoke();
@@ -155,8 +185,12 @@ namespace StereoCalibration.Services
             try
             {
                 RegisterDisplayIndices(new[] { markerId });
-                var position = GetSmoothedMarkerPosition(markerId, ConvertFromCamera1ToScene(x, y, z));
+                MarkerPositionsCamera1RawMm[markerId] = new Point3D(x, y, z);
+                var smoothedCam1 = GetSmoothedCamera1Position(markerId, new Point3D(x, y, z));
+                MarkerPositionsCamera1Mm[markerId] = smoothedCam1;
+                var position = ConvertFromCamera1ToScene(smoothedCam1.X, smoothedCam1.Y, smoothedCam1.Z);
                 MarkerPositions[markerId] = position;
+                LastTriangulatedFreshMarkerCount = 1;
                 OnSceneUpdated?.Invoke();
                 
                 // Дополнительная отладочная информация
@@ -191,14 +225,19 @@ namespace StereoCalibration.Services
                 {
                     RegisterDisplayIndices(markerPositions.Keys);
                 }
+                LastTriangulatedFreshMarkerCount = markerPositions.Count;
+                MarkerPositionsCamera1RawMm.Clear();
 
                 foreach (var marker in markerPositions)
                 {
-                    // Триангуляция возвращает координаты в СК камеры 1. Перед записью
-                    // в MarkerPositions переводим их в визуальный базис стереопары
-                    // и сглаживаем, чтобы 3D-сфера не дрожала от шума детекции.
-                    var measuredPosition = ConvertFromCamera1ToScene(marker.Value.X, marker.Value.Y, marker.Value.Z);
-                    MarkerPositions[marker.Key] = GetSmoothedMarkerPosition(marker.Key, measuredPosition);
+                    var measuredCam1 = new Point3D(marker.Value.X, marker.Value.Y, marker.Value.Z);
+                    MarkerPositionsCamera1RawMm[marker.Key] = measuredCam1;
+                    var smoothedCam1 = GetSmoothedCamera1Position(marker.Key, measuredCam1);
+                    MarkerPositionsCamera1Mm[marker.Key] = smoothedCam1;
+                    MarkerPositions[marker.Key] = ConvertFromCamera1ToScene(
+                        smoothedCam1.X,
+                        smoothedCam1.Y,
+                        smoothedCam1.Z);
                     _markerLastSeenFrame[marker.Key] = _currentFrameIndex;
                 }
 
@@ -213,8 +252,9 @@ namespace StereoCalibration.Services
                 foreach (var markerId in staleMarkerIds)
                 {
                     MarkerPositions.Remove(markerId);
+                    MarkerPositionsCamera1Mm.Remove(markerId);
                     _markerLastSeenFrame.Remove(markerId);
-                    _smoothedMarkerPositions.Remove(markerId);
+                    _smoothedMarkerPositionsCamera1.Remove(markerId);
                 }
 
                 OnSceneUpdated?.Invoke();
@@ -234,8 +274,10 @@ namespace StereoCalibration.Services
             if (MarkerPositions.ContainsKey(markerId))
             {
                 MarkerPositions.Remove(markerId);
+                MarkerPositionsCamera1Mm.Remove(markerId);
+                MarkerPositionsCamera1RawMm.Remove(markerId);
                 _markerLastSeenFrame.Remove(markerId);
-                _smoothedMarkerPositions.Remove(markerId);
+                _smoothedMarkerPositionsCamera1.Remove(markerId);
                 OnSceneUpdated?.Invoke();
             }
         }
@@ -248,8 +290,11 @@ namespace StereoCalibration.Services
             if (MarkerPositions.Count > 0)
             {
                 MarkerPositions.Clear();
+                MarkerPositionsCamera1Mm.Clear();
+                MarkerPositionsCamera1RawMm.Clear();
                 _markerLastSeenFrame.Clear();
-                _smoothedMarkerPositions.Clear();
+                _smoothedMarkerPositionsCamera1.Clear();
+                LastTriangulatedFreshMarkerCount = 0;
                 OnSceneUpdated?.Invoke();
             }
         }
@@ -287,10 +332,13 @@ namespace StereoCalibration.Services
             Camera2Position = new Point3D(0, 0, 0);
             StereoCenter = new Point3D(0, 0, 0);
             MarkerPositions.Clear();
+            MarkerPositionsCamera1Mm.Clear();
+            MarkerPositionsCamera1RawMm.Clear();
             MarkerDisplayIndices.Clear();
             _markerLastSeenFrame.Clear();
-            _smoothedMarkerPositions.Clear();
+            _smoothedMarkerPositionsCamera1.Clear();
             _currentFrameIndex = 0;
+                LastTriangulatedFreshMarkerCount = 0;
             IsCalibrated = false;
             OnSceneUpdated?.Invoke();
             
@@ -334,6 +382,8 @@ namespace StereoCalibration.Services
                 _sceneXAxisInCamera1 = new Vector3D(1, 0, 0);
                 _sceneYAxisInCamera1 = new Vector3D(0, 0, 1);
                 _sceneZAxisInCamera1 = new Vector3D(0, -1, 0);
+                _stereoCenterInCamera1 = new Point3D(0, 0, 0);
+                RebuildCamera1ToSceneTransform();
                 return;
             }
 
@@ -394,6 +444,7 @@ namespace StereoCalibration.Services
 
             sceneZ.Normalize();
             _sceneZAxisInCamera1 = sceneZ;
+            RebuildCamera1ToSceneTransform();
         }
 
         private Vector3D TransformCamera2DirectionToCamera1(Vector3D directionInCamera2, CalibrationResult calibrationResult)
@@ -432,6 +483,35 @@ namespace StereoCalibration.Services
             );
         }
 
+        /// <summary>
+        /// Явно конвертирует точку из СК камеры 1 в визуальную СК сцены.
+        /// </summary>
+        public Point3D ConvertCamera1PointToScene(Point3D point)
+        {
+            return ConvertFromCamera1ToScene(point.X, point.Y, point.Z);
+        }
+
+        /// <summary>
+        /// Обратное к <see cref="ConvertCamera1PointToScene"/> (ортогональный базис камеры ↔ сцена).
+        /// </summary>
+        public Point3D ConvertScenePointToCamera1(Point3D scenePoint)
+        {
+            if (_camera1ToSceneTransform is not MatrixTransform3D matrixTransform)
+                return scenePoint;
+
+            var inverted = matrixTransform.Value;
+            try
+            {
+                inverted.Invert();
+            }
+            catch (InvalidOperationException)
+            {
+                return scenePoint;
+            }
+
+            return inverted.Transform(scenePoint);
+        }
+
         private static double DistanceFromOrigin(Point3D point)
         {
             return Math.Sqrt(point.X * point.X + point.Y * point.Y + point.Z * point.Z);
@@ -444,18 +524,18 @@ namespace StereoCalibration.Services
         /// При большом скачке alpha увеличивается, иначе реальное быстрое движение
         /// таблички будет заметно запаздывать.
         /// </summary>
-        private Point3D GetSmoothedMarkerPosition(int markerId, Point3D measuredPosition)
+        private Point3D GetSmoothedCamera1Position(int markerId, Point3D measuredCamera1)
         {
-            if (!_smoothedMarkerPositions.TryGetValue(markerId, out var previousPosition))
+            if (!_smoothedMarkerPositionsCamera1.TryGetValue(markerId, out var previousPosition))
             {
-                _smoothedMarkerPositions[markerId] = measuredPosition;
-                return measuredPosition;
+                _smoothedMarkerPositionsCamera1[markerId] = measuredCamera1;
+                return measuredCamera1;
             }
 
-            var movement = Distance(previousPosition, measuredPosition);
+            var movement = Distance(previousPosition, measuredCamera1);
             var alpha = movement > FastMovementThresholdMm ? MarkerFastSmoothingAlpha : MarkerSmoothingAlpha;
-            var smoothedPosition = Lerp(previousPosition, measuredPosition, alpha);
-            _smoothedMarkerPositions[markerId] = smoothedPosition;
+            var smoothedPosition = Lerp(previousPosition, measuredCamera1, alpha);
+            _smoothedMarkerPositionsCamera1[markerId] = smoothedPosition;
             return smoothedPosition;
         }
 
@@ -474,6 +554,27 @@ namespace StereoCalibration.Services
             var dy = a.Y - b.Y;
             var dz = a.Z - b.Z;
             return Math.Sqrt(dx * dx + dy * dy + dz * dz);
+        }
+
+        private void RebuildCamera1ToSceneTransform()
+        {
+            var center = new Vector3D(
+                _stereoCenterInCamera1.X,
+                _stereoCenterInCamera1.Y,
+                _stereoCenterInCamera1.Z);
+
+            var matrix = new Matrix3D(
+                _sceneXAxisInCamera1.X, _sceneYAxisInCamera1.X, _sceneZAxisInCamera1.X, 0.0,
+                _sceneXAxisInCamera1.Y, _sceneYAxisInCamera1.Y, _sceneZAxisInCamera1.Y, 0.0,
+                _sceneXAxisInCamera1.Z, _sceneYAxisInCamera1.Z, _sceneZAxisInCamera1.Z, 0.0,
+                -Vector3D.DotProduct(center, _sceneXAxisInCamera1),
+                -Vector3D.DotProduct(center, _sceneYAxisInCamera1),
+                -Vector3D.DotProduct(center, _sceneZAxisInCamera1),
+                1.0);
+
+            _camera1ToSceneTransform = new MatrixTransform3D(matrix);
+            if (_camera1ToSceneTransform.CanFreeze)
+                _camera1ToSceneTransform.Freeze();
         }
 
         /// <summary>

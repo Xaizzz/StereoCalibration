@@ -1,13 +1,21 @@
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.Globalization;
 using System.Linq;
+using System.IO;
+using System.Text;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Data;
 using System.Windows.Media.Media3D;
 using System.Windows.Media;
+using System.Windows.Media.Imaging;
+using System.Windows.Threading;
 using System.Threading.Tasks;
+using Microsoft.Win32;
 using HelixToolkit.Wpf;
+using Newtonsoft.Json;
 using StereoCalibration.Services;
 
 namespace StereoCalibration.UI
@@ -113,6 +121,44 @@ namespace StereoCalibration.UI
     }
 
     /// <summary>
+    /// Строка таблицы: имя объекта маркера в OBJ и вводимый ArUco ID с камеры.
+    /// </summary>
+    public sealed class WoundMarkerBindingRow : INotifyPropertyChanged
+    {
+        private string _arucoIdText = "";
+
+        public WoundMarkerBindingRow(string modelObjectName, int? arucoId)
+        {
+            ModelObjectName = modelObjectName;
+            _arucoIdText = arucoId.HasValue
+                ? arucoId.Value.ToString(CultureInfo.InvariantCulture)
+                : "";
+        }
+
+        public string ModelObjectName { get; }
+
+        public string ArucoIdText
+        {
+            get => _arucoIdText;
+            set
+            {
+                if (_arucoIdText == value)
+                    return;
+
+                _arucoIdText = value ?? "";
+                OnPropertyChanged(nameof(ArucoIdText));
+            }
+        }
+
+        public event PropertyChangedEventHandler? PropertyChanged;
+
+        private void OnPropertyChanged(string propertyName)
+        {
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
+        }
+    }
+
+    /// <summary>
     /// WPF UserControl для отображения 3D-сцены стереокалибровки.
     /// 
     /// Несмотря на имя файла `.xaml.cs`, визуальная часть создаётся полностью
@@ -120,15 +166,16 @@ namespace StereoCalibration.UI
     /// вспомогательные панели. Контрол используется из WinForms через ElementHost.
     /// 
     /// Основные визуальные объекты: две камеры, центр стереопары, базовая линия,
-    /// сферы-маркеры, подписи, линии от объективов к маркерам и полупрозрачная
+    /// тонкие чип-маркеры, подписи, линии от объективов к маркерам и полупрозрачная
     /// деформируемая поверхность по маркерам.
     /// </summary>
     public class Scene3DUserControl : UserControl
     {
         #region Поля
         private Scene3DService? _scene3DService;
-        private readonly Dictionary<int, SphereVisual3D> _markerVisuals = new Dictionary<int, SphereVisual3D>();
+        private readonly Dictionary<int, BoxVisual3D> _markerVisuals = new Dictionary<int, BoxVisual3D>();
         private readonly Dictionary<int, TextVisual3D> _markerTexts = new Dictionary<int, TextVisual3D>();
+        private readonly Dictionary<int, LinesVisual3D> _woundPredictedGizmoVisuals = new Dictionary<int, LinesVisual3D>();
         
         // 3D элементы интерфейса
         private HelixViewport3D _viewport3D;
@@ -144,7 +191,12 @@ namespace StereoCalibration.UI
         private TextVisual3D _camera2Text;
         private TextVisual3D _centerText;
         private TextBlock _infoText;
-        private readonly Dictionary<int, LinesVisual3D> _markerGuideLines = new Dictionary<int, LinesVisual3D>();
+        private LinesVisual3D _markerGuideLinesVisual;
+        private LinesVisual3D _plannedPrintPathVisual;
+        private LinesVisual3D _printedPrintPathVisual;
+        private LinesVisual3D _printDebugNormalVisual;
+        private LinesVisual3D _woundMarkerFitDebugVisual;
+        private TruncatedConeVisual3D _printNozzleVisual;
         /// <summary>
         /// Единый визуальный объект поверхности по маркерам. Поверхность обновляется
         /// заменой геометрии MeshGeometry3D, а не созданием множества новых объектов,
@@ -153,33 +205,145 @@ namespace StereoCalibration.UI
         private ModelVisual3D _markerSurfaceVisual;
         private GeometryModel3D _markerSurfaceModel;
         private MeshGeometry3D _markerSurfaceMesh;
+        private ModelVisual3D _woundModelVisual;
+        private Model3DGroup _woundModelGroup;
+        private GeometryModel3D _woundModelModel;
+        private MeshGeometry3D _woundModelMesh;
+        private readonly Dictionary<string, Material> _woundMaterialCache = new Dictionary<string, Material>(StringComparer.OrdinalIgnoreCase);
+        private Material _woundFallbackMaterial;
+        private Material _woundFallbackBackMaterial;
+        private string? _activeWoundTexturePath;
         private readonly Dictionary<int, Point3D> _lastSurfaceMarkerSnapshot = new Dictionary<int, Point3D>();
+        private readonly HashSet<int> _lastSurfaceMarkerIds = new HashSet<int>();
         private readonly Dictionary<int, string> _markerTextCache = new Dictionary<int, string>();
+        private readonly Dictionary<int, Point3D> _lastTrajectoryMarkerSnapshot = new Dictionary<int, Point3D>();
+        private readonly Point3DCollection _printedTrajectoryPoints = new Point3DCollection();
         private DateTime _lastSurfaceUpdateTime = DateTime.MinValue;
+        private DateTime _surfaceTopologyChangeDetectedAt = DateTime.MinValue;
+        private DateTime _lastTrajectoryRebuildTime = DateTime.MinValue;
+        private DateTime _lastPrintTimerTickTime = DateTime.UtcNow;
         private DateTime _lastMarkerTableUpdateTime = DateTime.MinValue;
+        private DateTime _lastMarkerTextUpdateTime = DateTime.MinValue;
+        private DateTime _lastGuideLinesUpdateTime = DateTime.MinValue;
         private DateTime _lastInfoPanelUpdateTime = DateTime.MinValue;
+        private DateTime _lastWoundDiagnosticsWriteTime = DateTime.MinValue;
+        private DateTime _lastViewportParityLogUtc = DateTime.MinValue;
+        private bool _cameraVisualsInitialized = false;
+        private bool _lastCameraCalibrationState = false;
+        private Point3D _lastCamera1Position = new Point3D(double.NaN, double.NaN, double.NaN);
+        private Point3D _lastCamera2Position = new Point3D(double.NaN, double.NaN, double.NaN);
+        private Point3D _lastStereoCenterPosition = new Point3D(double.NaN, double.NaN, double.NaN);
+        private int _lastRenderedCompletedExtrusionCount = 0;
+        private int _lastRenderedActiveExtrusionIndex = -1;
+        private bool _isInternalScrubUpdate = false;
+        private bool _isScrubbing = false;
+        private bool _resumePlaybackAfterScrub = false;
+        private bool _trajectoryRebuildInProgress = false;
+        private bool _startPlaybackAfterProjection = false;
+        private bool _isPausedByInvalidSurface = false;
+        private bool _resumeAfterSurfaceRecovery = false;
+        private bool _showDeformationDebugOverlay = true;
+        private int _lastDeformationMarkerCount = 0;
+        private string _deformationStatus = "Ожидание mesh-референса.";
+        private int _trajectoryRebuildCount = 0;
+        private int _trajectoryRebuildFailureCount = 0;
+        private double _lastTrajectoryAvgDisplacementMm = 0.0;
+        private double _lastTrajectoryMaxDisplacementMm = 0.0;
+        private double _lastTrajectoryRebuildDurationMs = 0.0;
+        private bool _lastTrajectoryRebuildSucceeded = false;
+        private DateTime _lastTrajectoryRebuildCompletedAt = DateTime.MinValue;
+        private string _lastTrajectoryRebuildReason = "Ожидание перестроения.";
+        private List<KeyValuePair<int, Point3D>>? _pendingTrajectoryMarkers;
         
         // UI элементы для таблицы координат
         private DataGrid _coordinatesTable;
+        private Button _loadGCodeButton;
+        private Button _startPrintButton;
+        private Button _pausePrintButton;
+        private Button _stopPrintButton;
+        private Button _loadWoundModelButton;
+        private Slider _speedSlider;
+        private Slider _scrubSlider;
+        private CheckBox _debugOverlayCheckBox;
+        private CheckBox _showWoundModelCheckBox;
+        private TextBlock _speedValueText;
+        private TextBlock _gCodeStatusText;
+        private TextBlock _trajectoryDiagnosticsText;
+        private TextBlock _woundModelStatusText;
+        private DataGrid _woundMarkerBindingsGrid;
+        private Button _autoWoundMarkerBindingsButton;
+        private Button _applyWoundMarkerBindingsButton;
+        private Button _saveWoundMarkerBindingsButton;
+        private Button _resetWoundDeformationReferenceButton;
+        private ComboBox _printSurfaceModeCombo;
+        private System.Collections.ObjectModel.ObservableCollection<WoundMarkerBindingRow> _woundMarkerBindingRows;
         private System.Collections.ObjectModel.ObservableCollection<MarkerCoordinate> _markersData;
+        private readonly DispatcherTimer _printTimer;
+        private readonly GCodeParserService _gCodeParserService = new GCodeParserService();
+        private readonly WoundMeshProjectionService _woundMeshProjectionService = new WoundMeshProjectionService();
+        private readonly SurfaceProjectionService _surfaceProjectionService = new SurfaceProjectionService();
+        private readonly PrintTrajectoryService _printTrajectoryService = new PrintTrajectoryService();
+        private readonly WoundModelService _woundModelService = new WoundModelService();
+        private ParsedGCodePath? _parsedGCodePath;
+        private ProjectedPrintPath? _projectedPrintPath;
+        private WoundMeshPrintReference? _woundMeshPrintReference;
+        private SurfacePrintReference? _surfacePrintReference;
+        private PrintProjectionMode _printProjectionMode = PrintProjectionMode.WoundMesh;
+        private string _loadedGCodeFileName = string.Empty;
+
+        /// <summary>Режим привязки G-code при старте печати.</summary>
+        private enum PrintProjectionMode
+        {
+            WoundMesh,
+            MarkerSurface
+        }
         #endregion
 
         private const double CameraBodyHalfWidth = 7.5;
         private const double CameraLensOffset = CameraBodyHalfWidth + 2.0;
+        private const double StereoAxisLength = 350.0;
         private const int SurfaceUpdateIntervalMs = 300;
+        private const int SurfaceTopologyStabilizationMs = 250;
         private const int MarkerTableUpdateIntervalMs = 200;
+        private const int MarkerTextUpdateIntervalMs = 200;
+        private const int GuideLinesUpdateIntervalMs = 100;
         private const int InfoPanelUpdateIntervalMs = 500;
+        private const int WoundDiagnosticsFileWriteIntervalMs = 1000;
+        private const int ViewportMarkerParityLogIntervalMs = 750;
+        private const int PrintTimerIntervalMs = 50;
+        private const int TrajectoryRebuildIntervalMs = 80;
+        private const int MinMarkersForWoundMeshDeformation = WoundMeshProjectionService.MinMarkersForDeformation;
         private const int MaxSurfaceMarkers = 24;
         private const double SurfaceUpdateThresholdMm = 8.0;
+        private const double TrajectoryRebuildThresholdMm = 1.5;
+        private const double TrajectoryRunningRebuildThresholdMm = 0.8;
+        private const double CameraPositionUpdateThresholdMm = 0.1;
+        private const double NozzleHeight = 10.0;
+        private const double NozzleBaseRadius = 3.0;
+        private const double NozzleTopRadius = 0.35;
         private const double MinTriangleArea = 1e-3;
+
+        /// <summary>Плоские «диски» маркера в миллиметрах сцены (тонкий блок).</summary>
+        private const double MarkerChipExtentMm = 2.85;
+        private const double MarkerChipThicknessMm = 0.42;
+        private const byte MarkerChipFillAlpha = 88;
+
+        private const double PredictedGizmoHalfExtentMm = 2.0;
 
         /// <summary>
         /// Создаёт WPF-разметку и начальную 3D-сцену.
         /// </summary>
         public Scene3DUserControl()
         {
+            _printTimer = new DispatcherTimer(DispatcherPriority.Render)
+            {
+                Interval = TimeSpan.FromMilliseconds(PrintTimerIntervalMs)
+            };
+            _printTimer.Tick += PrintTimer_Tick;
             InitializeComponent();
             InitializeScene();
+            InitializePrintSubsystem();
+            _woundModelService.DiagnosticSink = WoundDiagnosticsSessionRecorder.Instance;
         }
 
         /// <summary>
@@ -200,6 +364,7 @@ namespace StereoCalibration.UI
             
             // Инициализируем данные для таблицы маркеров
             _markersData = new System.Collections.ObjectModel.ObservableCollection<MarkerCoordinate>();
+            _woundMarkerBindingRows = new System.Collections.ObjectModel.ObservableCollection<WoundMarkerBindingRow>();
             
             // Создаем HelixViewport3D с максимально совместимыми настройками рендеринга
             _viewport3D = new HelixViewport3D
@@ -331,6 +496,14 @@ namespace StereoCalibration.UI
                 Thickness = 3
             };
 
+            _markerGuideLinesVisual = new LinesVisual3D
+            {
+                Color = Colors.Gray,
+                Thickness = 1,
+                Points = new Point3DCollection()
+            };
+            _viewport3D.Children.Add(_markerGuideLinesVisual);
+
             _baselineText = new TextVisual3D
             {
                 Position = new Point3D(0, 0, 0),
@@ -384,6 +557,71 @@ namespace StereoCalibration.UI
             };
             _viewport3D.Children.Add(_markerSurfaceVisual);
 
+            _woundModelMesh = new MeshGeometry3D();
+            var woundBrush = new SolidColorBrush(Color.FromArgb(150, 210, 92, 92));
+            var woundBackBrush = new SolidColorBrush(Color.FromArgb(90, 210, 92, 92));
+            woundBrush.Freeze();
+            woundBackBrush.Freeze();
+            _woundFallbackMaterial = new DiffuseMaterial(woundBrush);
+            _woundFallbackBackMaterial = new DiffuseMaterial(woundBackBrush);
+            _woundModelModel = new GeometryModel3D
+            {
+                Geometry = _woundModelMesh,
+                Material = _woundFallbackMaterial,
+                BackMaterial = _woundFallbackBackMaterial,
+                Transform = Transform3D.Identity
+            };
+            _woundModelGroup = new Model3DGroup();
+            _woundModelGroup.Children.Add(_woundModelModel);
+            _woundModelVisual = new ModelVisual3D
+            {
+                Content = _woundModelGroup
+            };
+            _viewport3D.Children.Add(_woundModelVisual);
+
+            _plannedPrintPathVisual = new LinesVisual3D
+            {
+                Color = Color.FromArgb(220, 45, 130, 255),
+                Thickness = 1
+            };
+            _viewport3D.Children.Add(_plannedPrintPathVisual);
+
+            _printedPrintPathVisual = new LinesVisual3D
+            {
+                Color = Colors.Red,
+                Thickness = 3,
+                Points = _printedTrajectoryPoints
+            };
+            _viewport3D.Children.Add(_printedPrintPathVisual);
+
+            _printDebugNormalVisual = new LinesVisual3D
+            {
+                Color = Colors.DarkRed,
+                Thickness = 2,
+                Points = new Point3DCollection()
+            };
+            _viewport3D.Children.Add(_printDebugNormalVisual);
+
+            _woundMarkerFitDebugVisual = new LinesVisual3D
+            {
+                Color = Colors.OrangeRed,
+                Thickness = 1,
+                Points = new Point3DCollection()
+            };
+            _viewport3D.Children.Add(_woundMarkerFitDebugVisual);
+
+            _printNozzleVisual = new TruncatedConeVisual3D
+            {
+                Origin = new Point3D(0, 0, 0),
+                Normal = new Vector3D(0, 0, 1),
+                Height = NozzleHeight,
+                BaseRadius = NozzleBaseRadius,
+                TopRadius = NozzleTopRadius,
+                Fill = Brushes.DarkRed,
+                Visible = false
+            };
+            _viewport3D.Children.Add(_printNozzleVisual);
+
             // Добавляем viewport в первую колонку
             Grid.SetColumn(_viewport3D, 0);
             mainGrid.Children.Add(_viewport3D);
@@ -391,7 +629,7 @@ namespace StereoCalibration.UI
             // Создаем информационную панель
             var infoBorder = new Border
             {
-                Background = new SolidColorBrush(Color.FromArgb(170, 0, 0, 0)),
+                Background = new SolidColorBrush(Color.FromArgb(125, 0, 0, 0)),
                 HorizontalAlignment = HorizontalAlignment.Left,
                 VerticalAlignment = VerticalAlignment.Top,
                 Margin = new Thickness(10),
@@ -403,7 +641,7 @@ namespace StereoCalibration.UI
             {
                 Foreground = Brushes.White,
                 FontFamily = new FontFamily("Consolas"),
-                FontSize = 11,
+                FontSize = 9,
                 Text = "3D Сцена стереокалибровки\nКалибровка не выполнена",
                 FontWeight = FontWeights.Bold
             };
@@ -443,7 +681,9 @@ namespace StereoCalibration.UI
                 Background = Brushes.White,
                 FontSize = 10,
                 RowHeight = 25,
-                ColumnHeaderHeight = 30
+                ColumnHeaderHeight = 30,
+                Height = 150,
+                Margin = new Thickness(0, 0, 0, 10)
             };
 
             // Настраиваем колонки таблицы
@@ -479,7 +719,303 @@ namespace StereoCalibration.UI
             });
 
             rightPanel.Children.Add(_coordinatesTable);
-            mainGrid.Children.Add(rightPanel);
+
+            var woundHeader = new TextBlock
+            {
+                Text = "3D МОДЕЛЬ РАНЫ",
+                FontWeight = FontWeights.Bold,
+                FontSize = 13,
+                Foreground = Brushes.Firebrick,
+                Margin = new Thickness(0, 4, 0, 8)
+            };
+            rightPanel.Children.Add(woundHeader);
+
+            _loadWoundModelButton = new Button
+            {
+                Content = "Загрузить модель раны",
+                Height = 30,
+                Margin = new Thickness(0, 0, 0, 6)
+            };
+            _loadWoundModelButton.Click += async (_, _) => await LoadWoundModelAsync();
+            rightPanel.Children.Add(_loadWoundModelButton);
+
+            _showWoundModelCheckBox = new CheckBox
+            {
+                Content = "Показывать модель раны",
+                IsChecked = true,
+                Margin = new Thickness(0, 0, 0, 6),
+                FontSize = 10
+            };
+            _showWoundModelCheckBox.Checked += (_, _) => SetWoundModelVisibility(true);
+            _showWoundModelCheckBox.Unchecked += (_, _) => SetWoundModelVisibility(false);
+            rightPanel.Children.Add(_showWoundModelCheckBox);
+
+            _woundModelStatusText = new TextBlock
+            {
+                Text = "Модель раны не загружена",
+                FontSize = 10,
+                Foreground = Brushes.DimGray,
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 0, 0, 8)
+            };
+            rightPanel.Children.Add(_woundModelStatusText);
+
+            var woundBindingsCaption = new TextBlock
+            {
+                Text = "Соответствие OBJ ↔ ArUco ID",
+                FontWeight = FontWeights.SemiBold,
+                FontSize = 11,
+                Margin = new Thickness(0, 0, 0, 4)
+            };
+            rightPanel.Children.Add(woundBindingsCaption);
+
+            _woundMarkerBindingsGrid = new DataGrid
+            {
+                AutoGenerateColumns = false,
+                CanUserAddRows = false,
+                CanUserDeleteRows = false,
+                HeadersVisibility = DataGridHeadersVisibility.Column,
+                MaxHeight = 125,
+                Margin = new Thickness(0, 0, 0, 6),
+                ItemsSource = _woundMarkerBindingRows
+            };
+            _woundMarkerBindingsGrid.Columns.Add(new DataGridTextColumn
+            {
+                Header = "Объект в OBJ",
+                Binding = new Binding(nameof(WoundMarkerBindingRow.ModelObjectName))
+                {
+                    Mode = BindingMode.OneWay
+                },
+                IsReadOnly = true,
+                Width = new DataGridLength(1, DataGridLengthUnitType.Star)
+            });
+            _woundMarkerBindingsGrid.Columns.Add(new DataGridTextColumn
+            {
+                Header = "ArUco ID",
+                Binding = new Binding(nameof(WoundMarkerBindingRow.ArucoIdText))
+                {
+                    UpdateSourceTrigger = UpdateSourceTrigger.PropertyChanged
+                },
+                Width = 80
+            });
+            rightPanel.Children.Add(_woundMarkerBindingsGrid);
+
+            var woundBindingsButtons = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                Margin = new Thickness(0, 0, 0, 8)
+            };
+            _autoWoundMarkerBindingsButton = new Button
+            {
+                Content = "Авто",
+                Margin = new Thickness(0, 0, 6, 0),
+                Padding = new Thickness(8, 2, 8, 2),
+                IsEnabled = false
+            };
+            _autoWoundMarkerBindingsButton.Click += async (_, _) => await AutoWoundMarkerBindingsFromStereoAsync();
+            woundBindingsButtons.Children.Add(_autoWoundMarkerBindingsButton);
+            _applyWoundMarkerBindingsButton = new Button
+            {
+                Content = "Применить",
+                Margin = new Thickness(0, 0, 6, 0),
+                Padding = new Thickness(8, 2, 8, 2),
+                IsEnabled = false
+            };
+            _applyWoundMarkerBindingsButton.Click += (_, _) => ApplyWoundMarkerBindingsFromGrid();
+            woundBindingsButtons.Children.Add(_applyWoundMarkerBindingsButton);
+            _saveWoundMarkerBindingsButton = new Button
+            {
+                Content = "Сохранить в .markers.json",
+                Padding = new Thickness(8, 2, 8, 2),
+                IsEnabled = false
+            };
+            _saveWoundMarkerBindingsButton.Click += (_, _) => SaveWoundMarkerBindingsFromGrid();
+            woundBindingsButtons.Children.Add(_saveWoundMarkerBindingsButton);
+            rightPanel.Children.Add(woundBindingsButtons);
+
+            _resetWoundDeformationReferenceButton = new Button
+            {
+                Content = "Сбросить опору деформации",
+                Height = 28,
+                Margin = new Thickness(0, 0, 0, 8),
+                IsEnabled = false
+            };
+            _resetWoundDeformationReferenceButton.Click += (_, _) => ResetWoundDeformationReferenceClick();
+            rightPanel.Children.Add(_resetWoundDeformationReferenceButton);
+
+            var printHeader = new TextBlock
+            {
+                Text = "ТРАЕКТОРИЯ ПЕЧАТИ",
+                FontWeight = FontWeights.Bold,
+                FontSize = 13,
+                Foreground = Brushes.DarkRed,
+                Margin = new Thickness(0, 4, 0, 8)
+            };
+            rightPanel.Children.Add(printHeader);
+
+            _printSurfaceModeCombo = new ComboBox
+            {
+                Margin = new Thickness(0, 0, 0, 8),
+                FontSize = 10
+            };
+            _printSurfaceModeCombo.Items.Add("Печать по mesh модели раны");
+            _printSurfaceModeCombo.Items.Add("Печать по маркерной поверхности (≥6 ArUco)");
+            _printSurfaceModeCombo.SelectedIndex = 0;
+            _printSurfaceModeCombo.SelectionChanged += OnPrintProjectionModeChanged;
+            rightPanel.Children.Add(_printSurfaceModeCombo);
+
+            _loadGCodeButton = new Button
+            {
+                Content = "Загрузить G-code",
+                Height = 32,
+                Margin = new Thickness(0, 0, 0, 8)
+            };
+            _loadGCodeButton.Click += async (_, _) => await LoadGCodeAsync();
+            rightPanel.Children.Add(_loadGCodeButton);
+
+            var playbackButtonsPanel = new System.Windows.Controls.Primitives.UniformGrid
+            {
+                Columns = 3,
+                Margin = new Thickness(0, 0, 0, 8)
+            };
+
+            _startPrintButton = new Button
+            {
+                Content = "Старт",
+                Margin = new Thickness(0, 0, 4, 0),
+                Height = 30
+            };
+            _startPrintButton.Click += (_, _) => StartPrintPlayback();
+            playbackButtonsPanel.Children.Add(_startPrintButton);
+
+            _pausePrintButton = new Button
+            {
+                Content = "Пауза",
+                Margin = new Thickness(0, 0, 4, 0),
+                Height = 30
+            };
+            _pausePrintButton.Click += (_, _) => TogglePausePrintPlayback();
+            playbackButtonsPanel.Children.Add(_pausePrintButton);
+
+            _stopPrintButton = new Button
+            {
+                Content = "Стоп",
+                Height = 30
+            };
+            _stopPrintButton.Click += (_, _) => StopPrintPlayback();
+            playbackButtonsPanel.Children.Add(_stopPrintButton);
+            rightPanel.Children.Add(playbackButtonsPanel);
+
+            var speedPanel = new StackPanel
+            {
+                Orientation = Orientation.Vertical,
+                Margin = new Thickness(0, 0, 0, 6)
+            };
+            speedPanel.Children.Add(new TextBlock
+            {
+                Text = "Скорость печати",
+                FontSize = 11,
+                Margin = new Thickness(0, 0, 0, 2)
+            });
+
+            var speedRow = new DockPanel();
+            _speedSlider = new Slider
+            {
+                Minimum = 0.25,
+                Maximum = 3.0,
+                Value = 1.0,
+                TickFrequency = 0.25,
+                IsSnapToTickEnabled = false
+            };
+            _speedSlider.ValueChanged += (_, _) => OnSpeedChanged();
+            DockPanel.SetDock(_speedSlider, Dock.Left);
+            speedRow.Children.Add(_speedSlider);
+
+            _speedValueText = new TextBlock
+            {
+                Text = "1.00x",
+                Width = 52,
+                Margin = new Thickness(8, 0, 0, 0),
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            DockPanel.SetDock(_speedValueText, Dock.Right);
+            speedRow.Children.Add(_speedValueText);
+            speedPanel.Children.Add(speedRow);
+            rightPanel.Children.Add(speedPanel);
+
+            rightPanel.Children.Add(new TextBlock
+            {
+                Text = "Позиция печати",
+                FontSize = 11,
+                Margin = new Thickness(0, 0, 0, 2)
+            });
+
+            _scrubSlider = new Slider
+            {
+                Minimum = 0,
+                Maximum = 1,
+                Value = 0,
+                TickFrequency = 0.05,
+                IsSnapToTickEnabled = false,
+                Margin = new Thickness(0, 0, 0, 8)
+            };
+            _scrubSlider.ValueChanged += (_, _) => OnScrubChanged();
+            _scrubSlider.PreviewMouseLeftButtonDown += (_, _) => BeginScrub();
+            _scrubSlider.PreviewMouseLeftButtonUp += (_, _) => EndScrub();
+            rightPanel.Children.Add(_scrubSlider);
+
+            _debugOverlayCheckBox = new CheckBox
+            {
+                Content = "Debug overlay деформации",
+                IsChecked = true,
+                Margin = new Thickness(0, 0, 0, 6),
+                FontSize = 10
+            };
+            _debugOverlayCheckBox.Checked += (_, _) => OnDebugOverlayToggle(true);
+            _debugOverlayCheckBox.Unchecked += (_, _) => OnDebugOverlayToggle(false);
+            rightPanel.Children.Add(_debugOverlayCheckBox);
+
+            _gCodeStatusText = new TextBlock
+            {
+                Text = "G-code не загружен",
+                FontSize = 10,
+                Foreground = Brushes.DimGray,
+                TextWrapping = TextWrapping.Wrap
+            };
+            rightPanel.Children.Add(_gCodeStatusText);
+
+            var diagnosticsBorder = new Border
+            {
+                Background = new SolidColorBrush(Color.FromRgb(248, 250, 255)),
+                BorderBrush = new SolidColorBrush(Color.FromRgb(205, 214, 232)),
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(3),
+                Padding = new Thickness(6)
+            };
+            _trajectoryDiagnosticsText = new TextBlock
+            {
+                FontSize = 9.5,
+                FontFamily = new FontFamily("Consolas"),
+                Foreground = Brushes.DarkSlateGray,
+                TextWrapping = TextWrapping.Wrap
+            };
+            diagnosticsBorder.Child = _trajectoryDiagnosticsText;
+            rightPanel.Children.Add(new Expander
+            {
+                Header = "ДЕФОРМАЦИЯ И REBUILD",
+                IsExpanded = false,
+                Margin = new Thickness(0, 8, 0, 4),
+                Content = diagnosticsBorder
+            });
+
+            var rightScrollViewer = new ScrollViewer
+            {
+                Content = rightPanel,
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled
+            };
+            Grid.SetColumn(rightScrollViewer, 1);
+            mainGrid.Children.Add(rightScrollViewer);
 
             // Устанавливаем grid как содержимое UserControl
             this.Content = mainGrid;
@@ -515,6 +1051,1419 @@ namespace StereoCalibration.UI
             {
                 System.Diagnostics.Debug.WriteLine($"Ошибка инициализации 3D сцены: {ex.Message}");
             }
+        }
+
+        private bool IsMarkerSurfaceProjectionMode =>
+            _printProjectionMode == PrintProjectionMode.MarkerSurface;
+
+        private bool HasActivePrintReference =>
+            _woundMeshPrintReference != null || _surfacePrintReference != null;
+
+        private double ActiveProjectionSafetyClearanceMm =>
+            IsMarkerSurfaceProjectionMode
+                ? SurfaceProjectionService.SafetyClearanceMm
+                : WoundMeshProjectionService.SafetyClearanceMm;
+
+        private void OnPrintProjectionModeChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (_printSurfaceModeCombo == null)
+                return;
+
+            var next = _printSurfaceModeCombo.SelectedIndex == 1
+                ? PrintProjectionMode.MarkerSurface
+                : PrintProjectionMode.WoundMesh;
+            if (next == _printProjectionMode)
+                return;
+
+            _printProjectionMode = next;
+            InvalidateMeshProjectionState("сменён режим привязки печати.");
+        }
+
+        private void InitializePrintSubsystem()
+        {
+            _printProjectionMode = _printSurfaceModeCombo.SelectedIndex == 1
+                ? PrintProjectionMode.MarkerSurface
+                : PrintProjectionMode.WoundMesh;
+            _printTrajectoryService.SetSpeedMultiplier(_speedSlider.Value);
+            _scrubSlider.Value = 0;
+            _isPausedByInvalidSurface = false;
+            _resumeAfterSurfaceRecovery = false;
+            _deformationStatus = "Ожидание G-code.";
+            _trajectoryRebuildCount = 0;
+            _trajectoryRebuildFailureCount = 0;
+            _lastTrajectoryAvgDisplacementMm = 0;
+            _lastTrajectoryMaxDisplacementMm = 0;
+            _lastTrajectoryRebuildDurationMs = 0;
+            _lastTrajectoryRebuildSucceeded = false;
+            _lastTrajectoryRebuildCompletedAt = DateTime.MinValue;
+            _lastTrajectoryRebuildReason = "Ожидание перестроения.";
+            UpdatePrintControlState();
+            SetGCodeStatus("G-code не загружен");
+            SetWoundModelStatus("Модель раны не загружена");
+            UpdateTrajectoryDiagnosticsPanel();
+        }
+
+        private void SetGCodeStatus(string status)
+        {
+            _gCodeStatusText.Text = status;
+        }
+
+        private void UpdateTrajectoryDiagnosticsPanel()
+        {
+            var lastRebuildTimeText = _lastTrajectoryRebuildCompletedAt == DateTime.MinValue
+                ? "—"
+                : _lastTrajectoryRebuildCompletedAt.ToLocalTime().ToString("HH:mm:ss.fff");
+            var lastRebuildStatusText = _trajectoryRebuildCount == 0
+                ? "—"
+                : (_lastTrajectoryRebuildSucceeded ? "успешно" : "freeze/ошибка");
+
+            _trajectoryDiagnosticsText.Text =
+                $"Смещение маркеров: avg={_lastTrajectoryAvgDisplacementMm:F2} мм, max={_lastTrajectoryMaxDisplacementMm:F2} мм\n" +
+                $"Перестроений: {_trajectoryRebuildCount} (ошибок: {_trajectoryRebuildFailureCount})\n" +
+                $"Триггер: {_lastTrajectoryRebuildReason}\n" +
+                $"Последний rebuild: {lastRebuildStatusText}, {_lastTrajectoryRebuildDurationMs:F1} мс, {lastRebuildTimeText}\n" +
+                $"Статус деформации: {_deformationStatus}";
+        }
+
+        private (double AverageMm, double MaxMm, int SampleCount) CalculateTrajectoryDisplacementStats(
+            IReadOnlyList<KeyValuePair<int, Point3D>> markers)
+        {
+            if (markers.Count == 0 || _lastTrajectoryMarkerSnapshot.Count == 0)
+                return (0, 0, 0);
+
+            var sum = 0.0;
+            var max = 0.0;
+            var sampleCount = 0;
+            foreach (var marker in markers)
+            {
+                if (!_lastTrajectoryMarkerSnapshot.TryGetValue(marker.Key, out var previous))
+                    continue;
+
+                var displacement = Distance(previous, marker.Value);
+                sum += displacement;
+                max = Math.Max(max, displacement);
+                sampleCount++;
+            }
+
+            if (sampleCount == 0)
+                return (0, 0, 0);
+
+            return (sum / sampleCount, max, sampleCount);
+        }
+
+        private void UpdatePrintControlState()
+        {
+            var hasTrajectory = _projectedPrintPath != null && _printTrajectoryService.HasTrajectory;
+            var hasLoadedGCode = _parsedGCodePath != null;
+            _startPrintButton.IsEnabled = hasLoadedGCode;
+            _pausePrintButton.IsEnabled = hasTrajectory && !_isPausedByInvalidSurface;
+            _stopPrintButton.IsEnabled = hasTrajectory;
+            _speedSlider.IsEnabled = hasTrajectory;
+            _scrubSlider.IsEnabled = hasTrajectory;
+            _pausePrintButton.Content = _isPausedByInvalidSurface
+                ? "Автопауза"
+                : (_printTrajectoryService.IsRunning ? "Пауза" : "Продолжить");
+        }
+
+        private void OnSpeedChanged()
+        {
+            _printTrajectoryService.SetSpeedMultiplier(_speedSlider.Value);
+            _speedValueText.Text = $"{_speedSlider.Value:F2}x";
+        }
+
+        private void OnDebugOverlayToggle(bool enabled)
+        {
+            _showDeformationDebugOverlay = enabled;
+            if (!enabled)
+            {
+                _printDebugNormalVisual.Points = new Point3DCollection();
+            }
+        }
+
+        private void BeginScrub()
+        {
+            if (_projectedPrintPath == null)
+                return;
+
+            _isScrubbing = true;
+            _resumePlaybackAfterScrub = _printTrajectoryService.IsRunning;
+            if (_resumePlaybackAfterScrub)
+            {
+                _printTrajectoryService.Pause();
+            }
+
+            UpdatePrintControlState();
+        }
+
+        private void EndScrub()
+        {
+            if (_projectedPrintPath == null)
+                return;
+
+            _isScrubbing = false;
+            _printTrajectoryService.SeekNormalized(_scrubSlider.Value);
+            var snapshot = _printTrajectoryService.GetSnapshot();
+            UpdatePlaybackVisuals(snapshot, true);
+
+            if (_resumePlaybackAfterScrub)
+            {
+                _printTrajectoryService.Start();
+                _lastPrintTimerTickTime = DateTime.UtcNow;
+                if (!_printTimer.IsEnabled)
+                    _printTimer.Start();
+            }
+
+            _resumePlaybackAfterScrub = false;
+            UpdatePrintControlState();
+        }
+
+        private void OnScrubChanged()
+        {
+            if (_isInternalScrubUpdate || _projectedPrintPath == null)
+                return;
+
+            if (!_isScrubbing && _printTrajectoryService.IsRunning)
+                return;
+
+            _printTrajectoryService.SeekNormalized(_scrubSlider.Value);
+            var snapshot = _printTrajectoryService.GetSnapshot();
+            UpdatePlaybackVisuals(snapshot, true);
+        }
+
+        private async Task LoadWoundModelAsync()
+        {
+            var dialog = new OpenFileDialog
+            {
+                Filter = "OBJ model (*.obj)|*.obj|Все файлы (*.*)|*.*",
+                Title = "Выберите OBJ-модель раны"
+            };
+
+            var defaultModelPath = GetDefaultWoundModelPath();
+            if (!string.IsNullOrWhiteSpace(defaultModelPath))
+            {
+                dialog.InitialDirectory = Path.GetDirectoryName(defaultModelPath);
+                dialog.FileName = Path.GetFileName(defaultModelPath);
+            }
+
+            if (dialog.ShowDialog() != true)
+                return;
+
+            SetWoundModelStatus("Загрузка модели раны...");
+            await Task.Yield();
+
+            try
+            {
+                var loadResult = _woundModelService.Load(dialog.FileName);
+                if (_woundModelService.Mesh != null)
+                {
+                    _woundModelMesh = _woundModelService.Mesh;
+                }
+                _woundMaterialCache.Clear();
+                ApplyWoundModelMaterial();
+                UpdateWoundModelTransform();
+
+                SetWoundModelVisibility(_showWoundModelCheckBox.IsChecked == true);
+                SetWoundModelStatus(
+                    $"{Path.GetFileName(loadResult.SourcePath)}: vertices={loadResult.VertexCount}, " +
+                    $"triangles={loadResult.TriangleCount}, modelMarkers={loadResult.ModelMarkerCount}, " +
+                    $"linked={loadResult.LinkedMarkerCount}. {_woundModelService.Status}");
+                InvalidateMeshProjectionState("изменена модель раны, требуется новый mesh-референс.");
+                RefreshWoundMarkerBindingsGrid();
+                UpdateInfoPanel(force: true);
+            }
+            catch (Exception ex)
+            {
+                _woundModelMesh.Positions = new Point3DCollection();
+                _woundModelMesh.TriangleIndices = new Int32Collection();
+                SetWoundModelStatus($"Ошибка загрузки модели раны: {ex.Message}");
+                ClearWoundMarkerBindingsGrid();
+            }
+        }
+
+        private static string? GetDefaultWoundModelPath()
+        {
+            var candidates = new[]
+            {
+                Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "3d_deform.obj"),
+                Path.Combine(Directory.GetCurrentDirectory(), "3d_deform.obj"),
+                Path.Combine(Directory.GetCurrentDirectory(), "calibr", "3d_deform.obj")
+            };
+
+            return candidates.FirstOrDefault(File.Exists);
+        }
+
+        private void SetWoundModelVisibility(bool visible)
+        {
+            if (_woundModelVisual == null || _woundModelGroup == null)
+                return;
+
+            _woundModelVisual.Content = visible ? _woundModelGroup : null;
+        }
+
+        private void UpdateWoundModelTransform()
+        {
+            if (_woundModelVisual == null)
+                return;
+
+            if (_scene3DService == null || !_scene3DService.IsCalibrated)
+            {
+                _woundModelVisual.Transform = Transform3D.Identity;
+                return;
+            }
+
+            _woundModelVisual.Transform = _scene3DService.Camera1ToSceneTransform;
+        }
+
+        private void ApplyWoundModelMaterial()
+        {
+            if (_woundModelModel == null)
+                return;
+
+            RebuildWoundMaterialModels();
+            if (_woundModelGroup.Children.Count > 1)
+                return;
+
+            var texturePath = _woundModelService.ActiveTexturePath;
+            if (string.IsNullOrWhiteSpace(texturePath) || !File.Exists(texturePath))
+            {
+                _activeWoundTexturePath = null;
+                _woundModelModel.Material = _woundFallbackMaterial;
+                _woundModelModel.BackMaterial = _woundFallbackBackMaterial;
+                return;
+            }
+
+            if (string.Equals(_activeWoundTexturePath, texturePath, StringComparison.OrdinalIgnoreCase))
+                return;
+
+            try
+            {
+                var bitmap = new BitmapImage();
+                bitmap.BeginInit();
+                bitmap.CacheOption = BitmapCacheOption.OnLoad;
+                bitmap.UriSource = new Uri(texturePath, UriKind.Absolute);
+                bitmap.EndInit();
+                bitmap.Freeze();
+
+                var imageBrush = new ImageBrush(bitmap)
+                {
+                    Stretch = Stretch.Fill
+                };
+                imageBrush.Freeze();
+
+                var material = new DiffuseMaterial(imageBrush);
+                if (material.CanFreeze)
+                    material.Freeze();
+
+                _woundModelModel.Material = material;
+                _woundModelModel.BackMaterial = material;
+                _activeWoundTexturePath = texturePath;
+            }
+            catch (Exception ex)
+            {
+                _activeWoundTexturePath = null;
+                _woundModelModel.Material = _woundFallbackMaterial;
+                _woundModelModel.BackMaterial = _woundFallbackBackMaterial;
+                System.Diagnostics.Debug.WriteLine($"Ошибка загрузки texture map для модели раны: {ex.Message}");
+            }
+        }
+
+        private void RebuildWoundMaterialModels()
+        {
+            if (_woundModelService.Mesh == null || _woundModelGroup == null)
+                return;
+
+            var mesh = _woundModelService.Mesh;
+            var triangleMaterials = _woundModelService.TriangleMaterialNames;
+            var materialTextures = _woundModelService.MaterialTexturePaths;
+            if (triangleMaterials.Count == 0 ||
+                triangleMaterials.Count != mesh.TriangleIndices.Count / 3 ||
+                materialTextures.Count == 0)
+            {
+                _woundModelGroup.Children.Clear();
+                _woundModelModel.Geometry = mesh;
+                _woundModelGroup.Children.Add(_woundModelModel);
+                return;
+            }
+
+            _woundModelGroup.Children.Clear();
+            var groups = new Dictionary<string, MaterialMeshBuilder>(StringComparer.OrdinalIgnoreCase);
+            for (var triangle = 0; triangle < triangleMaterials.Count; triangle++)
+            {
+                var materialName = string.IsNullOrWhiteSpace(triangleMaterials[triangle])
+                    ? "__fallback__"
+                    : triangleMaterials[triangle]!;
+                if (!groups.TryGetValue(materialName, out var builder))
+                {
+                    builder = new MaterialMeshBuilder();
+                    groups[materialName] = builder;
+                }
+
+                for (var corner = 0; corner < 3; corner++)
+                {
+                    var globalIndex = mesh.TriangleIndices[triangle * 3 + corner];
+                    builder.TriangleIndices.Add(builder.GetLocalIndex(globalIndex, mesh));
+                }
+            }
+
+            foreach (var group in groups.OrderBy(item => item.Key, StringComparer.OrdinalIgnoreCase))
+            {
+                var material = CreateWoundMaterialFor(group.Key, materialTextures);
+                var geometry = new MeshGeometry3D
+                {
+                    Positions = new Point3DCollection(group.Value.Positions),
+                    TriangleIndices = new Int32Collection(group.Value.TriangleIndices),
+                    TextureCoordinates = new PointCollection(group.Value.TextureCoordinates)
+                };
+
+                _woundModelGroup.Children.Add(new GeometryModel3D
+                {
+                    Geometry = geometry,
+                    Material = material,
+                    BackMaterial = material
+                });
+            }
+        }
+
+        private Material CreateWoundMaterialFor(
+            string materialName,
+            IReadOnlyDictionary<string, string> materialTextures)
+        {
+            if (_woundMaterialCache.TryGetValue(materialName, out var cached))
+                return cached;
+
+            if (!materialTextures.TryGetValue(materialName, out var texturePath) ||
+                string.IsNullOrWhiteSpace(texturePath) ||
+                !File.Exists(texturePath))
+            {
+                _woundMaterialCache[materialName] = _woundFallbackMaterial;
+                return _woundFallbackMaterial;
+            }
+
+            try
+            {
+                var bitmap = new BitmapImage();
+                bitmap.BeginInit();
+                bitmap.CacheOption = BitmapCacheOption.OnLoad;
+                bitmap.UriSource = new Uri(texturePath, UriKind.Absolute);
+                bitmap.EndInit();
+                bitmap.Freeze();
+
+                var brush = new ImageBrush(bitmap)
+                {
+                    Stretch = Stretch.Fill
+                };
+                brush.Freeze();
+                var material = new DiffuseMaterial(brush);
+                if (material.CanFreeze)
+                    material.Freeze();
+
+                _woundMaterialCache[materialName] = material;
+                return material;
+            }
+            catch
+            {
+                _woundMaterialCache[materialName] = _woundFallbackMaterial;
+                return _woundFallbackMaterial;
+            }
+        }
+
+        private sealed class MaterialMeshBuilder
+        {
+            private readonly Dictionary<int, int> _globalToLocal = new Dictionary<int, int>();
+
+            public List<Point3D> Positions { get; } = new List<Point3D>();
+            public List<Point> TextureCoordinates { get; } = new List<Point>();
+            public List<int> TriangleIndices { get; } = new List<int>();
+
+            public int GetLocalIndex(int globalIndex, MeshGeometry3D source)
+            {
+                if (_globalToLocal.TryGetValue(globalIndex, out var localIndex))
+                    return localIndex;
+
+                localIndex = Positions.Count;
+                _globalToLocal[globalIndex] = localIndex;
+                Positions.Add(source.Positions[globalIndex]);
+                TextureCoordinates.Add(
+                    source.TextureCoordinates != null && globalIndex < source.TextureCoordinates.Count
+                        ? source.TextureCoordinates[globalIndex]
+                        : new Point(0.5, 0.5));
+                return localIndex;
+            }
+        }
+
+        private void SetWoundModelStatus(string status)
+        {
+            _woundModelStatusText.Text = status;
+        }
+
+        private void InvalidateMeshProjectionState(string reason)
+        {
+            _woundMeshPrintReference = null;
+            _surfacePrintReference = null;
+            _pendingTrajectoryMarkers = null;
+
+            if (_parsedGCodePath == null)
+                return;
+
+            ClearTrajectoryVisuals(keepParsedPath: true);
+            if (!string.IsNullOrWhiteSpace(_loadedGCodeFileName))
+            {
+                SetGCodeStatus($"{_loadedGCodeFileName}: {reason}");
+            }
+        }
+
+        private void SetWoundMarkerBindingActionsEnabled(bool enabled)
+        {
+            if (_autoWoundMarkerBindingsButton != null)
+                _autoWoundMarkerBindingsButton.IsEnabled = enabled;
+            if (_applyWoundMarkerBindingsButton != null)
+                _applyWoundMarkerBindingsButton.IsEnabled = enabled;
+            if (_saveWoundMarkerBindingsButton != null)
+                _saveWoundMarkerBindingsButton.IsEnabled = enabled;
+        }
+
+        private void ClearWoundMarkerBindingsGrid()
+        {
+            _woundMarkerBindingRows.Clear();
+            SetWoundMarkerBindingActionsEnabled(false);
+            if (_resetWoundDeformationReferenceButton != null)
+                _resetWoundDeformationReferenceButton.IsEnabled = false;
+        }
+
+        private void RefreshWoundMarkerBindingsGrid()
+        {
+            _woundMarkerBindingRows.Clear();
+            if (!_woundModelService.HasModel)
+            {
+                SetWoundMarkerBindingActionsEnabled(false);
+                if (_resetWoundDeformationReferenceButton != null)
+                    _resetWoundDeformationReferenceButton.IsEnabled = false;
+                return;
+            }
+
+            foreach (var kv in _woundModelService.GetMarkerBindingMapSnapshot())
+                _woundMarkerBindingRows.Add(new WoundMarkerBindingRow(kv.Key, kv.Value));
+
+            SetWoundMarkerBindingActionsEnabled(_woundMarkerBindingRows.Count > 0);
+            if (_resetWoundDeformationReferenceButton != null)
+                _resetWoundDeformationReferenceButton.IsEnabled = true;
+        }
+
+        private void ResetWoundDeformationReferenceClick()
+        {
+            if (!_woundModelService.HasModel)
+                return;
+
+            _woundModelService.ResetDeformationReference();
+            if (_woundModelService.Mesh != null && _woundModelModel != null)
+                _woundModelMesh = _woundModelService.Mesh;
+            ApplyWoundModelMaterial();
+            UpdateWoundModelTransform();
+            InvalidateMeshProjectionState("опора деформации модели сброшена.");
+
+            SetWoundModelStatus(_woundModelService.Status);
+            UpdateInfoPanel(force: true);
+        }
+
+        private Dictionary<string, int?> BuildMarkerBindingMapFromGrid()
+        {
+            var map = new Dictionary<string, int?>(StringComparer.OrdinalIgnoreCase);
+            foreach (var row in _woundMarkerBindingRows)
+            {
+                var text = row.ArucoIdText?.Trim() ?? "";
+                if (text.Length == 0)
+                {
+                    map[row.ModelObjectName] = null;
+                    continue;
+                }
+
+                if (!int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var id) ||
+                    id < 0)
+                {
+                    throw new FormatException(
+                        $"Некорректный ArUco ID для «{row.ModelObjectName}»: «{row.ArucoIdText}». Ожидается неотрицательное целое или пусто.");
+                }
+
+                map[row.ModelObjectName] = id;
+            }
+
+            return map;
+        }
+
+        private async Task AutoWoundMarkerBindingsFromStereoAsync()
+        {
+            if (!_woundModelService.HasModel)
+                return;
+
+            var visibleCamera1MarkerCount = _scene3DService?.MarkerPositionsCamera1RawMm.Count > 0
+                ? _scene3DService.MarkerPositionsCamera1RawMm.Count
+                : _scene3DService?.MarkerPositionsCamera1Mm.Count ?? 0;
+            if (_scene3DService == null ||
+                !_scene3DService.IsCalibrated ||
+                visibleCamera1MarkerCount < 3)
+            {
+                MessageBox.Show(
+                    "Для автопривязки нужны видимые 3D ArUco-маркеры после стереокалибровки.",
+                    "Автопривязка маркеров",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Warning);
+                return;
+            }
+
+            try
+            {
+                var markerSnapshot = _scene3DService.MarkerPositionsCamera1Mm
+                    .ToDictionary(item => item.Key, item => item.Value);
+                if (_scene3DService.MarkerPositionsCamera1RawMm.Count > 0)
+                {
+                    markerSnapshot = _scene3DService.MarkerPositionsCamera1RawMm
+                    .ToDictionary(item => item.Key, item => item.Value);
+                }
+                SetWoundMarkerBindingActionsEnabled(false);
+                SetWoundModelStatus("Автопривязка marker1.* -> ArUco...");
+                var autoBindingResult = await Task.Run(() =>
+                {
+                    var map = _woundModelService.BuildAutoMarkerBindingMap(
+                        markerSnapshot,
+                        out var rmseMm);
+                    return (Map: map, RmseMm: rmseMm);
+                });
+
+                foreach (var row in _woundMarkerBindingRows)
+                {
+                    row.ArucoIdText = autoBindingResult.Map.TryGetValue(row.ModelObjectName, out var arucoId) && arucoId.HasValue
+                        ? arucoId.Value.ToString(CultureInfo.InvariantCulture)
+                        : "";
+                }
+
+                var loadResult = _woundModelService.ApplyMarkerBindings(autoBindingResult.Map);
+                if (_woundModelService.Mesh != null)
+                    _woundModelMesh = _woundModelService.Mesh;
+                ApplyWoundModelMaterial();
+                UpdateWoundModelTransform();
+                InvalidateMeshProjectionState("автопривязка маркеров модели обновила соответствия.");
+
+                SetWoundModelStatus(
+                    $"{Path.GetFileName(loadResult.SourcePath)}: автопривязка RMSE {autoBindingResult.RmseMm:F1} мм, " +
+                    $"связано {loadResult.LinkedMarkerCount}. {_woundModelService.Status}");
+                UpdateInfoPanel(force: true);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(
+                    ex.Message,
+                    "Автопривязка маркеров",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Warning);
+            }
+            finally
+            {
+                SetWoundMarkerBindingActionsEnabled(_woundMarkerBindingRows.Count > 0);
+            }
+        }
+
+        private void ApplyWoundMarkerBindingsFromGrid()
+        {
+            if (!_woundModelService.HasModel)
+                return;
+
+            try
+            {
+                var map = BuildMarkerBindingMapFromGrid();
+                var loadResult = _woundModelService.ApplyMarkerBindings(map);
+                if (_woundModelService.Mesh != null)
+                    _woundModelMesh = _woundModelService.Mesh;
+                ApplyWoundModelMaterial();
+                UpdateWoundModelTransform();
+                InvalidateMeshProjectionState("изменены соответствия маркеров модели.");
+
+                SetWoundModelStatus(
+                    $"{Path.GetFileName(loadResult.SourcePath)}: связано маркеров {loadResult.LinkedMarkerCount}. {_woundModelService.Status}");
+                UpdateInfoPanel(force: true);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(
+                    ex.Message,
+                    "Соответствие маркеров",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Warning);
+            }
+        }
+
+        private void SaveWoundMarkerBindingsFromGrid()
+        {
+            if (!_woundModelService.HasModel)
+                return;
+
+            try
+            {
+                var map = BuildMarkerBindingMapFromGrid();
+                var loadResult = _woundModelService.ApplyMarkerBindings(map);
+                if (_woundModelService.Mesh != null)
+                    _woundModelMesh = _woundModelService.Mesh;
+                ApplyWoundModelMaterial();
+                UpdateWoundModelTransform();
+                InvalidateMeshProjectionState("изменены и сохранены соответствия маркеров модели.");
+
+                _woundModelService.SaveMarkerBindingsToSidecar(map);
+                SetWoundModelStatus(
+                    $"{Path.GetFileName(loadResult.SourcePath)}: связано {loadResult.LinkedMarkerCount}. {_woundModelService.Status}");
+                UpdateInfoPanel(force: true);
+                MessageBox.Show(
+                    "Соответствия применены и записаны в .markers.json рядом с OBJ.",
+                    "Соответствие маркеров",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Information);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(
+                    ex.Message,
+                    "Сохранение маркеров",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Warning);
+            }
+        }
+
+        private async Task LoadGCodeAsync()
+        {
+            var dialog = new OpenFileDialog
+            {
+                Filter = "G-code (*.gcode;*.gco;*.gc;*.nc)|*.gcode;*.gco;*.gc;*.nc|Все файлы (*.*)|*.*",
+                Title = "Выберите G-code файл"
+            };
+
+            if (dialog.ShowDialog() != true)
+                return;
+
+            SetGCodeStatus("Чтение и парсинг G-code...");
+
+            try
+            {
+                var parsedPath = await Task.Run(() => _gCodeParserService.ParseFile(dialog.FileName));
+                if (parsedPath.Moves.Count == 0)
+                {
+                    _parsedGCodePath = null;
+                    _projectedPrintPath = null;
+                    _loadedGCodeFileName = string.Empty;
+                    ClearTrajectoryVisuals(keepParsedPath: false);
+                    SetGCodeStatus("Файл не содержит поддерживаемых перемещений G0/G1.");
+                    return;
+                }
+
+                _parsedGCodePath = parsedPath;
+                _loadedGCodeFileName = Path.GetFileName(dialog.FileName);
+                _woundMeshPrintReference = null;
+                _surfacePrintReference = null;
+                _isPausedByInvalidSurface = false;
+                _resumeAfterSurfaceRecovery = false;
+                _deformationStatus = IsMarkerSurfaceProjectionMode
+                    ? "Ожидание фиксации референса по маркерам."
+                    : "Ожидание фиксации mesh-референса.";
+                _lastTrajectoryMarkerSnapshot.Clear();
+                ClearTrajectoryVisuals(keepParsedPath: true);
+                SetGCodeStatus(
+                    $"{_loadedGCodeFileName}: загружен ({parsedPath.Moves.Count} move). " +
+                    "Нажмите Старт для фиксации референса печати.");
+            }
+            catch (Exception ex)
+            {
+                ClearTrajectoryVisuals(keepParsedPath: true);
+                _deformationStatus = "Ошибка загрузки G-code.";
+                SetGCodeStatus($"Ошибка загрузки G-code: {ex.Message}");
+            }
+        }
+
+        private void RequestTrajectoryProjection(
+            IReadOnlyList<KeyValuePair<int, Point3D>> orderedMarkers,
+            bool preservePlaybackState,
+            string rebuildReason)
+        {
+            if (_parsedGCodePath == null || !HasActivePrintReference)
+                return;
+
+            _lastTrajectoryRebuildReason = rebuildReason;
+
+            var meshVerticesScene = new List<Point3D>();
+            var rawMarkersSnapshot = orderedMarkers.ToList();
+
+            if (_surfacePrintReference != null)
+            {
+                _lastDeformationMarkerCount = rawMarkersSnapshot.Count;
+                if (_lastDeformationMarkerCount < SurfaceProjectionService.MinMarkersForDeformation)
+                {
+                    HandleInvalidSurface(
+                        $"Режим маркеров: нужно минимум {SurfaceProjectionService.MinMarkersForDeformation} ArUco в кадре, сейчас {_lastDeformationMarkerCount}.");
+                    return;
+                }
+            }
+            else
+            {
+                _lastDeformationMarkerCount = Math.Max(0, _woundModelService.ActiveMarkerCount);
+                if (_lastDeformationMarkerCount < MinMarkersForWoundMeshDeformation)
+                {
+                    HandleInvalidSurface(
+                        $"Для деформации модели нужно минимум {MinMarkersForWoundMeshDeformation} связ. маркеров, сейчас {_lastDeformationMarkerCount}.");
+                    return;
+                }
+
+                if (!TryGetCurrentWoundMeshSceneSnapshot(out meshVerticesScene, out _))
+                {
+                    HandleInvalidSurface("Не удалось получить деформированный mesh модели для проекции.");
+                    return;
+                }
+            }
+
+            if (_trajectoryRebuildInProgress)
+            {
+                _pendingTrajectoryMarkers = orderedMarkers.ToList();
+                return;
+            }
+
+            _trajectoryRebuildInProgress = true;
+            _lastTrajectoryRebuildTime = DateTime.UtcNow;
+
+            var displacementStats = rawMarkersSnapshot.Count == 0
+                ? (AverageMm: 0.0, MaxMm: 0.0, SampleCount: 0)
+                : CalculateTrajectoryDisplacementStats(rawMarkersSnapshot);
+            _lastTrajectoryAvgDisplacementMm = displacementStats.AverageMm;
+            _lastTrajectoryMaxDisplacementMm = displacementStats.MaxMm;
+            UpdateTrajectoryDiagnosticsPanel();
+
+            var preferredSidePoint = GetCameraSideReferencePoint();
+            var resumeProgress = preservePlaybackState ? _printTrajectoryService.NormalizedProgress : 0.0;
+            var resumePlayback = preservePlaybackState && _printTrajectoryService.IsRunning;
+            var rebuildStopwatch = System.Diagnostics.Stopwatch.StartNew();
+            var snapshotSurfacePrintRef = _surfacePrintReference;
+            var snapshotWoundPrintRef = _woundMeshPrintReference;
+
+            Task.Run(() =>
+            {
+                if (snapshotSurfacePrintRef != null &&
+                    _surfaceProjectionService.TryProjectPath(
+                        snapshotSurfacePrintRef,
+                        rawMarkersSnapshot,
+                        preferredSidePoint,
+                        out var surfaceProjected))
+                {
+                    return surfaceProjected;
+                }
+
+                if (snapshotWoundPrintRef != null &&
+                    _woundMeshProjectionService.TryProjectPath(
+                        snapshotWoundPrintRef,
+                        meshVerticesScene,
+                        preferredSidePoint,
+                        out var meshProjected))
+                {
+                    return meshProjected;
+                }
+
+                return (ProjectedPrintPath?)null;
+            }).ContinueWith(task =>
+            {
+                Dispatcher.Invoke(() =>
+                {
+                    var rebuildSucceeded = false;
+                    try
+                    {
+                        if (task.Exception != null)
+                        {
+                            HandleInvalidSurface($"Ошибка проекции: {task.Exception.GetBaseException().Message}");
+                            return;
+                        }
+
+                        var projectedPath = task.Result;
+                        if (projectedPath == null)
+                        {
+                            HandleInvalidSurface("Невалидная геометрия поверхности, проекция заморожена.");
+                            return;
+                        }
+
+                        if (!IsProjectedPathRuntimeValid(projectedPath))
+                        {
+                            HandleInvalidSurface("Проверка no-penetration/runtime не пройдена, оставлена последняя валидная геометрия.");
+                            return;
+                        }
+
+                        ApplyProjectedPath(projectedPath, resumeProgress, resumePlayback || _startPlaybackAfterProjection);
+                        UpdatePrintDebugVisual(rawMarkersSnapshot, preferredSidePoint);
+                        HandleSurfaceRecovered();
+                        rebuildSucceeded = true;
+                        _startPlaybackAfterProjection = false;
+                        _lastTrajectoryMarkerSnapshot.Clear();
+                        foreach (var marker in rawMarkersSnapshot)
+                        {
+                            _lastTrajectoryMarkerSnapshot[marker.Key] = marker.Value;
+                        }
+                    }
+                    finally
+                    {
+                        rebuildStopwatch.Stop();
+                        _trajectoryRebuildCount++;
+                        if (!rebuildSucceeded)
+                        {
+                            _trajectoryRebuildFailureCount++;
+                        }
+
+                        _lastTrajectoryRebuildSucceeded = rebuildSucceeded;
+                        _lastTrajectoryRebuildDurationMs = rebuildStopwatch.Elapsed.TotalMilliseconds;
+                        _lastTrajectoryRebuildCompletedAt = DateTime.UtcNow;
+                        UpdateTrajectoryDiagnosticsPanel();
+
+                        _trajectoryRebuildInProgress = false;
+
+                        if (_pendingTrajectoryMarkers != null)
+                        {
+                            var pending = _pendingTrajectoryMarkers;
+                            _pendingTrajectoryMarkers = null;
+                            var allowImmediateRetry = _isPausedByInvalidSurface ||
+                                                      (DateTime.UtcNow - _lastTrajectoryRebuildTime).TotalMilliseconds >= TrajectoryRebuildIntervalMs;
+                            if (allowImmediateRetry)
+                            {
+                                RequestTrajectoryProjection(pending, preservePlaybackState: true, rebuildReason);
+                            }
+                        }
+                    }
+                });
+            }, TaskScheduler.Default);
+        }
+
+        private void UpdatePrintDebugVisual(
+            IReadOnlyList<KeyValuePair<int, Point3D>> surfaceMarkers,
+            Point3D preferredSidePoint)
+        {
+            if (!_showDeformationDebugOverlay || surfaceMarkers.Count == 0)
+            {
+                _printDebugNormalVisual.Points = new Point3DCollection();
+                return;
+            }
+
+            var center = new Point3D(
+                surfaceMarkers.Average(marker => marker.Value.X),
+                surfaceMarkers.Average(marker => marker.Value.Y),
+                surfaceMarkers.Average(marker => marker.Value.Z));
+            var direction = preferredSidePoint - center;
+            if (direction.Length < 1e-6)
+            {
+                _printDebugNormalVisual.Points = new Point3DCollection();
+                return;
+            }
+
+            direction.Normalize();
+            _printDebugNormalVisual.Points = new Point3DCollection
+            {
+                center,
+                center + direction * 35.0
+            };
+        }
+
+        private void HandleInvalidSurface(string reason)
+        {
+            var status = $"Невалидная геометрия: {reason}";
+            var isSameStatus = string.Equals(_deformationStatus, status, StringComparison.Ordinal);
+            _deformationStatus = status;
+            _lastTrajectoryRebuildSucceeded = false;
+
+            if (!_isPausedByInvalidSurface)
+            {
+                _resumeAfterSurfaceRecovery = _printTrajectoryService.IsRunning;
+                _isPausedByInvalidSurface = true;
+            }
+
+            if (_printTrajectoryService.IsRunning)
+            {
+                _printTrajectoryService.Pause();
+                _printTimer.Stop();
+            }
+
+            if (_isPausedByInvalidSurface && isSameStatus && !_printTrajectoryService.IsRunning)
+            {
+                UpdateTrajectoryDiagnosticsPanel();
+                UpdatePrintControlState();
+                return;
+            }
+
+            if (!string.IsNullOrWhiteSpace(_loadedGCodeFileName))
+            {
+                SetGCodeStatus($"{_loadedGCodeFileName}: {reason} Геометрия заморожена.");
+            }
+            else
+            {
+                SetGCodeStatus(reason);
+            }
+
+            UpdateTrajectoryDiagnosticsPanel();
+            UpdatePrintControlState();
+        }
+
+        private void HandleSurfaceRecovered()
+        {
+            _deformationStatus = $"Геометрия валидна, clearance={ActiveProjectionSafetyClearanceMm:F1} мм";
+            if (!_isPausedByInvalidSurface)
+            {
+                UpdateTrajectoryDiagnosticsPanel();
+                return;
+            }
+
+            _isPausedByInvalidSurface = false;
+            var shouldResume = _resumeAfterSurfaceRecovery;
+            _resumeAfterSurfaceRecovery = false;
+
+            if (shouldResume && _projectedPrintPath != null && _printTrajectoryService.HasTrajectory)
+            {
+                _printTrajectoryService.Start();
+                _lastPrintTimerTickTime = DateTime.UtcNow;
+                if (!_printTimer.IsEnabled)
+                    _printTimer.Start();
+
+                SetGCodeStatus($"{_loadedGCodeFileName}: геометрия восстановлена, печать продолжена.");
+            }
+            else if (!string.IsNullOrWhiteSpace(_loadedGCodeFileName))
+            {
+                SetGCodeStatus($"{_loadedGCodeFileName}: геометрия восстановлена.");
+            }
+
+            UpdateTrajectoryDiagnosticsPanel();
+            UpdatePrintControlState();
+        }
+
+        private static bool IsProjectedPathRuntimeValid(ProjectedPrintPath projectedPath)
+        {
+            const double maxReasonableSegmentLengthMm = 2500.0;
+
+            foreach (var move in projectedPath.Moves)
+            {
+                if (!IsFinitePoint(move.Start) || !IsFinitePoint(move.End))
+                    return false;
+
+                if (Distance(move.Start, move.End) > maxReasonableSegmentLengthMm)
+                    return false;
+            }
+
+            return true;
+        }
+
+        private static bool IsFinitePoint(Point3D point)
+        {
+            return !double.IsNaN(point.X) &&
+                   !double.IsNaN(point.Y) &&
+                   !double.IsNaN(point.Z) &&
+                   !double.IsInfinity(point.X) &&
+                   !double.IsInfinity(point.Y) &&
+                   !double.IsInfinity(point.Z);
+        }
+
+        private Point3D GetCameraSideReferencePoint()
+        {
+            if (_scene3DService == null || !_scene3DService.IsCalibrated)
+                return new Point3D(0, 0, 0);
+
+            var cam1 = _scene3DService.Camera1Position;
+            var cam2 = _scene3DService.Camera2Position;
+            return new Point3D(
+                (cam1.X + cam2.X) / 2.0,
+                (cam1.Y + cam2.Y) / 2.0,
+                (cam1.Z + cam2.Z) / 2.0);
+        }
+
+        private void ApplyProjectedPath(ProjectedPrintPath projectedPath, double normalizedProgress, bool resumePlayback)
+        {
+            _projectedPrintPath = projectedPath;
+            _printTrajectoryService.LoadTrajectory(projectedPath);
+            _printTrajectoryService.SeekNormalized(normalizedProgress);
+
+            var snapshot = _printTrajectoryService.GetSnapshot();
+            UpdatePlaybackVisuals(snapshot, true);
+
+            if (resumePlayback)
+            {
+                _printTrajectoryService.Start();
+                _lastPrintTimerTickTime = DateTime.UtcNow;
+                if (!_printTimer.IsEnabled)
+                    _printTimer.Start();
+            }
+
+            SetGCodeStatus(
+                $"{_loadedGCodeFileName}: move={projectedPath.Moves.Count}, " +
+                $"print={projectedPath.ExtrusionMoves.Count}, markers={projectedPath.MarkerCount}. " +
+                $"clearance={ActiveProjectionSafetyClearanceMm:F1} мм.");
+            UpdatePrintControlState();
+        }
+
+        private void UpdatePlannedTrajectoryVisual(PrintPlaybackSnapshot snapshot)
+        {
+            if (_projectedPrintPath == null)
+            {
+                _plannedPrintPathVisual.Points = new Point3DCollection();
+                return;
+            }
+
+            var extrusionMoves = _projectedPrintPath.ExtrusionMoves;
+            if (extrusionMoves.Count == 0)
+            {
+                _plannedPrintPathVisual.Points = new Point3DCollection();
+                return;
+            }
+
+            var points = new Point3DCollection(extrusionMoves.Count * 2);
+            var nextMoveIndex = Math.Min(snapshot.CompletedExtrusionCount, extrusionMoves.Count);
+
+            if (snapshot.ActiveExtrusionIndex >= 0 && snapshot.ActiveExtrusionIndex < extrusionMoves.Count)
+            {
+                var activeMove = extrusionMoves[snapshot.ActiveExtrusionIndex];
+                var activeSegmentStart = Lerp(activeMove.Start, activeMove.End, snapshot.ActiveExtrusionProgress);
+                points.Add(activeSegmentStart);
+                points.Add(activeMove.End);
+                nextMoveIndex = Math.Max(nextMoveIndex, snapshot.ActiveExtrusionIndex + 1);
+            }
+
+            for (var index = nextMoveIndex; index < extrusionMoves.Count; index++)
+            {
+                points.Add(extrusionMoves[index].Start);
+                points.Add(extrusionMoves[index].End);
+            }
+
+            _plannedPrintPathVisual.Points = points;
+        }
+
+        private void StartPrintPlayback()
+        {
+            if (_parsedGCodePath == null)
+                return;
+
+            if (_isPausedByInvalidSurface)
+            {
+                var need = IsMarkerSurfaceProjectionMode
+                    ? SurfaceProjectionService.MinMarkersForDeformation
+                    : MinMarkersForWoundMeshDeformation;
+                SetGCodeStatus($"Автопауза: нужно минимум {need} маркеров для текущего режима печати.");
+                return;
+            }
+
+            if (!HasActivePrintReference || _projectedPrintPath == null || !_printTrajectoryService.HasTrajectory)
+            {
+                if (!TryCapturePrintReference())
+                    return;
+
+                _startPlaybackAfterProjection = true;
+                var markerCandidates = _scene3DService == null
+                    ? new List<KeyValuePair<int, Point3D>>()
+                    : GetTrajectoryMarkerCandidates(_scene3DService.MarkerPositions);
+                RequestTrajectoryProjection(
+                    markerCandidates,
+                    preservePlaybackState: false,
+                    rebuildReason: "Старт печати / фиксация референса");
+                SetGCodeStatus(IsMarkerSurfaceProjectionMode
+                    ? $"{_loadedGCodeFileName}: фиксирую поверхность по маркерам и строю траекторию..."
+                    : $"{_loadedGCodeFileName}: фиксирую mesh-референс и строю биопечать...");
+                return;
+            }
+
+            _printTrajectoryService.Start();
+            _lastPrintTimerTickTime = DateTime.UtcNow;
+            if (!_printTimer.IsEnabled)
+                _printTimer.Start();
+
+            UpdatePrintControlState();
+        }
+
+        private bool TryCapturePrintReference()
+        {
+            if (_parsedGCodePath == null || _scene3DService == null || !_scene3DService.IsCalibrated)
+            {
+                SetGCodeStatus("Нужна калибровка и загруженный G-code для старта печати.");
+                return false;
+            }
+
+            var preferredSidePoint = GetCameraSideReferencePoint();
+
+            if (IsMarkerSurfaceProjectionMode)
+            {
+                _woundMeshPrintReference = null;
+                var ordered = GetSurfaceMarkerCandidates(_scene3DService.MarkerPositions);
+                if (ordered.Count < SurfaceProjectionService.MinMarkersForDeformation)
+                {
+                    _deformationStatus =
+                        $"Режим маркеров: {ordered.Count}/{SurfaceProjectionService.MinMarkersForDeformation}+ ArUco в кадре.";
+                    UpdateTrajectoryDiagnosticsPanel();
+                    SetGCodeStatus(
+                        $"Для печати по маркерам нужно минимум {SurfaceProjectionService.MinMarkersForDeformation} видимых ArUco.");
+                    return false;
+                }
+
+                if (!_surfaceProjectionService.TryCreateReference(
+                    _parsedGCodePath,
+                    ordered,
+                    preferredSidePoint,
+                    out var surfaceRef))
+                {
+                    SetGCodeStatus("Не удалось зафиксировать референс по маркерной поверхности.");
+                    return false;
+                }
+
+                _surfacePrintReference = surfaceRef;
+                _deformationStatus = "Референс по маркерам зафиксирован.";
+                _isPausedByInvalidSurface = false;
+                _resumeAfterSurfaceRecovery = false;
+                _lastDeformationMarkerCount = ordered.Count;
+                UpdateTrajectoryDiagnosticsPanel();
+                return true;
+            }
+
+            _surfacePrintReference = null;
+
+            if (!_woundModelService.HasModel || !_woundModelService.HasMesh)
+            {
+                SetGCodeStatus("Загрузите OBJ-модель раны и дождитесь её синхронизации перед стартом печати в режиме mesh.");
+                return false;
+            }
+
+            var supportMarkerCount = Math.Max(0, _woundModelService.ActiveMarkerCount);
+            if (supportMarkerCount < MinMarkersForWoundMeshDeformation)
+            {
+                _deformationStatus =
+                    $"Ожидание маркеров модели: {supportMarkerCount}/{MinMarkersForWoundMeshDeformation}+";
+                UpdateTrajectoryDiagnosticsPanel();
+                SetGCodeStatus(
+                    $"Для старта печати нужно минимум {MinMarkersForWoundMeshDeformation} связанных маркера модели.");
+                return false;
+            }
+
+            if (!TryGetCurrentWoundMeshSceneSnapshot(out var meshVerticesScene, out var meshTriangles))
+            {
+                SetGCodeStatus("Не удалось сформировать snapshot деформированной модели для печати.");
+                return false;
+            }
+
+            if (!_woundMeshProjectionService.TryCreateReference(
+                _parsedGCodePath,
+                meshVerticesScene,
+                meshTriangles,
+                supportMarkerCount,
+                preferredSidePoint,
+                out var printReference))
+            {
+                SetGCodeStatus("Не удалось зафиксировать референсную mesh-поверхность печати.");
+                return false;
+            }
+
+            _woundMeshPrintReference = printReference;
+            _deformationStatus = "Референс mesh зафиксирован, деформация активна.";
+            _isPausedByInvalidSurface = false;
+            _resumeAfterSurfaceRecovery = false;
+            _lastDeformationMarkerCount = supportMarkerCount;
+
+            UpdateTrajectoryDiagnosticsPanel();
+            return true;
+        }
+
+        private void TogglePausePrintPlayback()
+        {
+            if (_projectedPrintPath == null || !_printTrajectoryService.HasTrajectory)
+                return;
+
+            if (_isPausedByInvalidSurface)
+                return;
+
+            if (_printTrajectoryService.IsRunning)
+            {
+                _printTrajectoryService.Pause();
+                _printTimer.Stop();
+            }
+            else
+            {
+                _printTrajectoryService.Start();
+                _lastPrintTimerTickTime = DateTime.UtcNow;
+                if (!_printTimer.IsEnabled)
+                    _printTimer.Start();
+            }
+
+            UpdatePrintControlState();
+        }
+
+        private void StopPrintPlayback()
+        {
+            _printTrajectoryService.Stop();
+            _printTimer.Stop();
+            _isPausedByInvalidSurface = false;
+            _resumeAfterSurfaceRecovery = false;
+            var snapshot = _printTrajectoryService.GetSnapshot();
+            UpdatePlaybackVisuals(snapshot, true);
+            UpdatePrintControlState();
+        }
+
+        private void PrintTimer_Tick(object? sender, EventArgs e)
+        {
+            if (!_printTrajectoryService.IsRunning)
+            {
+                _printTimer.Stop();
+                UpdatePrintControlState();
+                return;
+            }
+
+            var now = DateTime.UtcNow;
+            var deltaSeconds = Math.Max(0, (now - _lastPrintTimerTickTime).TotalSeconds);
+            _lastPrintTimerTickTime = now;
+
+            var snapshot = _printTrajectoryService.Advance(deltaSeconds);
+            UpdatePlaybackVisuals(snapshot, false);
+
+            if (snapshot.IsFinished)
+            {
+                _printTimer.Stop();
+                UpdatePrintControlState();
+            }
+        }
+
+        private void UpdatePlaybackVisuals(PrintPlaybackSnapshot snapshot, bool forceRebuild)
+        {
+            UpdatePlannedTrajectoryVisual(snapshot);
+            UpdatePrintedTrajectoryVisual(snapshot, forceRebuild);
+            UpdateNozzleVisual(snapshot);
+
+            _isInternalScrubUpdate = true;
+            _scrubSlider.Value = snapshot.NormalizedProgress;
+            _isInternalScrubUpdate = false;
+        }
+
+        private void UpdatePrintedTrajectoryVisual(PrintPlaybackSnapshot snapshot, bool forceRebuild)
+        {
+            if (_projectedPrintPath == null)
+            {
+                _printedTrajectoryPoints.Clear();
+                _printedPrintPathVisual.Points = _printedTrajectoryPoints;
+                return;
+            }
+
+            var extrusionMoves = _projectedPrintPath.ExtrusionMoves;
+            if (forceRebuild || snapshot.CompletedExtrusionCount < _lastRenderedCompletedExtrusionCount)
+            {
+                RebuildPrintedTrajectoryVisual(snapshot, extrusionMoves);
+                return;
+            }
+
+            if (_lastRenderedActiveExtrusionIndex >= 0 && _printedTrajectoryPoints.Count >= 2)
+            {
+                _printedTrajectoryPoints.RemoveAt(_printedTrajectoryPoints.Count - 1);
+                _printedTrajectoryPoints.RemoveAt(_printedTrajectoryPoints.Count - 1);
+            }
+
+            for (var index = _lastRenderedCompletedExtrusionCount;
+                 index < Math.Min(snapshot.CompletedExtrusionCount, extrusionMoves.Count);
+                 index++)
+            {
+                _printedTrajectoryPoints.Add(extrusionMoves[index].Start);
+                _printedTrajectoryPoints.Add(extrusionMoves[index].End);
+            }
+
+            if (snapshot.ActiveExtrusionIndex >= 0 && snapshot.ActiveExtrusionIndex < extrusionMoves.Count)
+            {
+                var activeMove = extrusionMoves[snapshot.ActiveExtrusionIndex];
+                _printedTrajectoryPoints.Add(activeMove.Start);
+                _printedTrajectoryPoints.Add(Lerp(activeMove.Start, activeMove.End, snapshot.ActiveExtrusionProgress));
+            }
+
+            _lastRenderedCompletedExtrusionCount = Math.Min(snapshot.CompletedExtrusionCount, extrusionMoves.Count);
+            _lastRenderedActiveExtrusionIndex = snapshot.ActiveExtrusionIndex;
+            _printedPrintPathVisual.Points = _printedTrajectoryPoints;
+        }
+
+        private void RebuildPrintedTrajectoryVisual(PrintPlaybackSnapshot snapshot, IReadOnlyList<GCodeMove> extrusionMoves)
+        {
+            _printedTrajectoryPoints.Clear();
+            for (var index = 0; index < Math.Min(snapshot.CompletedExtrusionCount, extrusionMoves.Count); index++)
+            {
+                _printedTrajectoryPoints.Add(extrusionMoves[index].Start);
+                _printedTrajectoryPoints.Add(extrusionMoves[index].End);
+            }
+
+            if (snapshot.ActiveExtrusionIndex >= 0 && snapshot.ActiveExtrusionIndex < extrusionMoves.Count)
+            {
+                var activeMove = extrusionMoves[snapshot.ActiveExtrusionIndex];
+                _printedTrajectoryPoints.Add(activeMove.Start);
+                _printedTrajectoryPoints.Add(Lerp(activeMove.Start, activeMove.End, snapshot.ActiveExtrusionProgress));
+            }
+
+            _lastRenderedCompletedExtrusionCount = Math.Min(snapshot.CompletedExtrusionCount, extrusionMoves.Count);
+            _lastRenderedActiveExtrusionIndex = snapshot.ActiveExtrusionIndex;
+            _printedPrintPathVisual.Points = _printedTrajectoryPoints;
+        }
+
+        private void UpdateNozzleVisual(PrintPlaybackSnapshot snapshot)
+        {
+            if (_projectedPrintPath == null)
+            {
+                _printNozzleVisual.Visible = false;
+                return;
+            }
+
+            var surfaceSideNormal = GetCameraSideReferencePoint() - snapshot.NozzlePosition;
+            if (surfaceSideNormal.Length < 1e-6)
+            {
+                surfaceSideNormal = new Vector3D(0, 0, 1);
+            }
+            else
+            {
+                surfaceSideNormal.Normalize();
+            }
+
+            // Кончик сопла должен находиться в точке печати. Для TruncatedConeVisual3D
+            // origin соответствует основанию, поэтому сдвигаем основание назад по оси.
+            var coneAxisToTip = -surfaceSideNormal;
+            var coneBaseOrigin = snapshot.NozzlePosition + surfaceSideNormal * NozzleHeight;
+
+            _printNozzleVisual.Visible = true;
+            _printNozzleVisual.Normal = coneAxisToTip;
+            _printNozzleVisual.Origin = coneBaseOrigin;
+        }
+
+        private void ClearTrajectoryVisuals(bool keepParsedPath)
+        {
+            _printTimer.Stop();
+            _printTrajectoryService.Stop();
+            _isPausedByInvalidSurface = false;
+            _resumeAfterSurfaceRecovery = false;
+            _deformationStatus = !keepParsedPath
+                ? "Ожидание G-code."
+                : IsMarkerSurfaceProjectionMode
+                    ? "Ожидание референса по маркерной поверхности (≥6 ArUco)."
+                    : "Ожидание фиксации mesh-референса.";
+            _lastDeformationMarkerCount = 0;
+            _trajectoryRebuildCount = 0;
+            _trajectoryRebuildFailureCount = 0;
+            _lastTrajectoryAvgDisplacementMm = 0;
+            _lastTrajectoryMaxDisplacementMm = 0;
+            _lastTrajectoryRebuildDurationMs = 0;
+            _lastTrajectoryRebuildSucceeded = false;
+            _lastTrajectoryRebuildCompletedAt = DateTime.MinValue;
+            _lastTrajectoryRebuildReason = "Ожидание перестроения.";
+            _projectedPrintPath = null;
+            _plannedPrintPathVisual.Points = new Point3DCollection();
+            _printedTrajectoryPoints.Clear();
+            _printedPrintPathVisual.Points = _printedTrajectoryPoints;
+            _printDebugNormalVisual.Points = new Point3DCollection();
+            _printNozzleVisual.Visible = false;
+            _lastRenderedCompletedExtrusionCount = 0;
+            _lastRenderedActiveExtrusionIndex = -1;
+            _pendingTrajectoryMarkers = null;
+            _startPlaybackAfterProjection = false;
+
+            if (!keepParsedPath)
+            {
+                _parsedGCodePath = null;
+                _woundMeshPrintReference = null;
+                _surfacePrintReference = null;
+                _loadedGCodeFileName = string.Empty;
+                _lastTrajectoryMarkerSnapshot.Clear();
+            }
+
+            _isInternalScrubUpdate = true;
+            _scrubSlider.Value = 0;
+            _isInternalScrubUpdate = false;
+            UpdateTrajectoryDiagnosticsPanel();
+            UpdatePrintControlState();
         }
 
         /// <summary>
@@ -841,6 +2790,27 @@ namespace StereoCalibration.UI
             try
             {
                 bool isCalibrated = _scene3DService.IsCalibrated;
+                var cam1Pos = _scene3DService.Camera1Position;
+                var cam2Pos = _scene3DService.Camera2Position;
+                var centerPos = _scene3DService.StereoCenter;
+                var cameraStateChanged = !_cameraVisualsInitialized ||
+                                         _lastCameraCalibrationState != isCalibrated ||
+                                         Distance(_lastCamera1Position, cam1Pos) > CameraPositionUpdateThresholdMm ||
+                                         Distance(_lastCamera2Position, cam2Pos) > CameraPositionUpdateThresholdMm ||
+                                         Distance(_lastStereoCenterPosition, centerPos) > CameraPositionUpdateThresholdMm;
+
+                if (!cameraStateChanged)
+                    return;
+
+                _cameraVisualsInitialized = true;
+                var wasCalibrated = _lastCameraCalibrationState;
+                _lastCameraCalibrationState = isCalibrated;
+                _lastCamera1Position = cam1Pos;
+                _lastCamera2Position = cam2Pos;
+                _lastStereoCenterPosition = centerPos;
+
+                if (isCalibrated && !wasCalibrated && _scene3DService != null)
+                    WoundDiagnosticsSessionRecorder.Instance.LogCalibration("viewport_calibration_applied", _scene3DService);
                 
                 // Показать/скрыть камеры
                 _camera1Visual.Visible = isCalibrated;
@@ -867,21 +2837,18 @@ namespace StereoCalibration.UI
                         _viewport3D.Children.Add(_baselineText);
 
                     // Камера 1 (смещена от центра координат)
-                    var cam1Pos = _scene3DService.Camera1Position;
                     _camera1Visual.Center = new Point3D(cam1Pos.X, cam1Pos.Y, cam1Pos.Z);
                     _camera1LensVisual.Center = GetCameraLensPoint(cam1Pos);
                     _camera1Text.Position = new Point3D(cam1Pos.X + 15, cam1Pos.Y + 15, cam1Pos.Z + 15);
                     _camera1Text.Text = $"Камера 1\n({cam1Pos.X:F0}, {cam1Pos.Y:F0}, {cam1Pos.Z:F0}) мм";
 
                     // Камера 2
-                    var cam2Pos = _scene3DService.Camera2Position;
                     _camera2Visual.Center = new Point3D(cam2Pos.X, cam2Pos.Y, cam2Pos.Z);
                     _camera2LensVisual.Center = GetCameraLensPoint(cam2Pos);
                     _camera2Text.Position = new Point3D(cam2Pos.X + 15, cam2Pos.Y + 15, cam2Pos.Z + 15);
                     _camera2Text.Text = $"Камера 2\n({cam2Pos.X:F0}, {cam2Pos.Y:F0}, {cam2Pos.Z:F0}) мм";
 
                     // Центр стереосистемы
-                    var centerPos = _scene3DService.StereoCenter;
                     _stereoCenterVisual.Origin = new Point3D(centerPos.X, centerPos.Y, centerPos.Z);
                     _centerText.Position = new Point3D(centerPos.X + 15, centerPos.Y + 15, centerPos.Z + 15);
                     _centerText.Text = $"Центр\n({centerPos.X:F0}, {centerPos.Y:F0}, {centerPos.Z:F0}) мм";
@@ -916,13 +2883,7 @@ namespace StereoCalibration.UI
         /// </summary>
         private void UpdateStereoGuides(Point3D cam1Pos, Point3D cam2Pos, Point3D centerPos)
         {
-            var farthestMarkerY = _scene3DService?.MarkerPositions.Values
-                .Select(marker => marker.Y)
-                .DefaultIfEmpty(350)
-                .Max() ?? 350;
-
-            var axisLength = Math.Max(350, farthestMarkerY + 80);
-            var axisEnd = new Point3D(centerPos.X, axisLength, centerPos.Z);
+            var axisEnd = new Point3D(centerPos.X, centerPos.Y + StereoAxisLength, centerPos.Z);
 
             _cameraBaselineVisual.Points = new Point3DCollection
             {
@@ -970,12 +2931,13 @@ namespace StereoCalibration.UI
                 }
 
                 // Добавляем или обновляем маркеры в стабильном порядке отображения
+                var shouldUpdateMarkerText = ShouldUpdateMarkerText();
                 foreach (var marker in currentMarkers.OrderBy(m => GetMarkerDisplayIndex(m.Key)).ThenBy(m => m.Key))
                 {
                     if (_markerVisuals.ContainsKey(marker.Key))
                     {
                         // Обновляем существующий маркер
-                        UpdateMarkerVisual(marker.Key, marker.Value, shouldUpdateMarkerTable);
+                        UpdateMarkerVisual(marker.Key, marker.Value, shouldUpdateMarkerText, shouldUpdateMarkerTable);
                     }
                     else
                     {
@@ -984,7 +2946,10 @@ namespace StereoCalibration.UI
                     }
                 }
 
+                UpdateMarkerGuideLines(currentMarkers);
                 UpdateMarkerSurface(currentMarkers);
+                UpdateWoundModel();
+                TryRebuildProjectedTrajectory(currentMarkers);
                 if (markerSetChanged || shouldUpdateMarkerTable)
                 {
                     SortMarkersTable();
@@ -994,6 +2959,17 @@ namespace StereoCalibration.UI
                 {
                     ClearMarkerGuideLines();
                     ClearMarkerSurface();
+                    UpdateWoundModel();
+                    if (_projectedPrintPath != null)
+                    {
+                        ClearTrajectoryVisuals(keepParsedPath: true);
+                        _woundMeshPrintReference = null;
+                        _surfacePrintReference = null;
+                        SetGCodeStatus(
+                            string.IsNullOrWhiteSpace(_loadedGCodeFileName)
+                                ? "G-code не загружен"
+                                : $"{_loadedGCodeFileName}: ожидание калибровки.");
+                    }
                 }
             }
             catch (Exception ex)
@@ -1003,43 +2979,39 @@ namespace StereoCalibration.UI
         }
 
         /// <summary>
-        /// Создаёт сферу, подпись, направляющие линии и строку таблицы для нового маркера.
-        /// 
-        /// Сфера остаётся основным визуальным обозначением маркера даже при включённой
-        /// поверхности. Поверхность является дополнительным слоем и не заменяет точки.
+        /// Создаёт тонкий плоский чип, подпись и строку таблицы для нового маркера.
         /// </summary>
         private void CreateMarkerVisual(int markerId, Point3D position)
         {
             try
             {
-                // Создаем сферу для маркера
-                var markerSphere = new SphereVisual3D
+                var baseColor = GetMarkerColor(markerId);
+                var extent = MarkerChipExtentMm * 2.0;
+                var markerChip = new BoxVisual3D
                 {
                     Center = position,
-                    Radius = 5,
-                    Fill = new SolidColorBrush(GetMarkerColor(markerId))
+                    Length = extent,
+                    Width = extent,
+                    Height = MarkerChipThicknessMm,
+                    Fill = new SolidColorBrush(Color.FromArgb(MarkerChipFillAlpha, baseColor.R, baseColor.G, baseColor.B))
                 };
 
                 var displayIndex = GetMarkerDisplayIndex(markerId);
                 var markerName = GetMarkerName(markerId);
-                var markerLabel = GetMarkerLabel(markerId);
+                var markerHudText = BuildMarkerHudText(markerId, position, markerName);
 
-                // Создаем текст для маркера
                 var markerText = new TextVisual3D
                 {
                     Position = new Point3D(position.X + 8, position.Y + 8, position.Z + 8),
-                    Text = $"{markerLabel}\n({position.X:F0}, {position.Y:F0}, {position.Z:F0}) мм",
+                    Text = markerHudText,
                     Foreground = Brushes.Black,
                     FontSize = 10
                 };
 
-                // Добавляем в сцену
-                _viewport3D.Children.Add(markerSphere);
+                _viewport3D.Children.Add(markerChip);
                 _viewport3D.Children.Add(markerText);
-                CreateOrUpdateMarkerGuideLine(markerId, position);
 
-                // Сохраняем ссылки
-                _markerVisuals[markerId] = markerSphere;
+                _markerVisuals[markerId] = markerChip;
                 _markerTexts[markerId] = markerText;
                 _markerTextCache[markerId] = markerText.Text;
                 
@@ -1049,7 +3021,7 @@ namespace StereoCalibration.UI
                 {
                     ID = markerId,
                     DisplayIndex = displayIndex,
-                    Name = markerLabel,
+                    Name = $"ArUco {markerId}",
                     X = position.X.ToString("F0"),
                     Y = position.Y.ToString("F0"),
                     Z = position.Z.ToString("F0"),
@@ -1057,7 +3029,7 @@ namespace StereoCalibration.UI
                 };
                 AddMarkerDataSorted(newMarker);
                 
-                System.Diagnostics.Debug.WriteLine($"3D: Создан {markerName} (ArUco ID {markerId})");
+                System.Diagnostics.Debug.WriteLine($"3D: Создан {markerName}, ArUco {markerId}");
             }
             catch (Exception ex)
             {
@@ -1066,33 +3038,29 @@ namespace StereoCalibration.UI
         }
 
         /// <summary>
-        /// Обновляет положение существующего маркера.
-        /// 
-        /// Координаты сферы обновляются каждый кадр, потому что это лёгкая операция.
-        /// Текст и таблица обновляются только при изменении округлённых значений или
-        /// по throttle-флагу, чтобы WPF не перерисовывал тяжёлые текстовые элементы
-        /// слишком часто.
+        /// Обновляет положение существующего маркера (чипа).
         /// </summary>
-        private void UpdateMarkerVisual(int markerId, Point3D position, bool updateTable)
+        private void UpdateMarkerVisual(int markerId, Point3D position, bool updateText, bool updateTable)
         {
             try
             {
-                if (_markerVisuals.TryGetValue(markerId, out var visual) && 
+                if (_markerVisuals.TryGetValue(markerId, out var chip) &&
                     _markerTexts.TryGetValue(markerId, out var text))
                 {
                     var displayIndex = GetMarkerDisplayIndex(markerId);
-                    var markerLabel = GetMarkerLabel(markerId);
+                    var markerHudText = BuildMarkerHudText(markerId, position, GetMarkerName(markerId));
 
-                    visual.Center = position;
-                    text.Position = new Point3D(position.X + 8, position.Y + 8, position.Z + 8);
-                    var markerText = $"{markerLabel}\n({position.X:F0}, {position.Y:F0}, {position.Z:F0}) мм";
-                    if (!_markerTextCache.TryGetValue(markerId, out var previousText) || previousText != markerText)
+                    chip.Center = position;
+                    if (updateText)
                     {
-                        text.Text = markerText;
-                        _markerTextCache[markerId] = markerText;
+                        text.Position = new Point3D(position.X + 8, position.Y + 8, position.Z + 8);
+                        var markerText = markerHudText;
+                        if (!_markerTextCache.TryGetValue(markerId, out var previousText) || previousText != markerText)
+                        {
+                            text.Text = markerText;
+                            _markerTextCache[markerId] = markerText;
+                        }
                     }
-
-                    CreateOrUpdateMarkerGuideLine(markerId, position);
                     
                     // Обновляем данные в таблице
                     if (updateTable)
@@ -1102,7 +3070,7 @@ namespace StereoCalibration.UI
                         {
                             var distance = Math.Sqrt(position.X * position.X + position.Y * position.Y + position.Z * position.Z);
                             markerData.DisplayIndex = displayIndex;
-                            markerData.Name = markerLabel;
+                            markerData.Name = $"ArUco {markerId}";
                             markerData.X = position.X.ToString("F0");
                             markerData.Y = position.Y.ToString("F0");
                             markerData.Z = position.Z.ToString("F0");
@@ -1137,8 +3105,6 @@ namespace StereoCalibration.UI
                     _markerTextCache.Remove(markerId);
                 }
 
-                RemoveMarkerGuideLine(markerId);
-
                 // Удаляем из таблицы (только реальные маркеры, не системные объекты)
                 var markerData = _markersData.FirstOrDefault(m => m.ID == markerId && m.ID >= 0);
                 if (markerData != null)
@@ -1154,42 +3120,44 @@ namespace StereoCalibration.UI
         }
 
         /// <summary>
-        /// Создание или обновление тонких линий от камер к маркеру.
-        /// Они показывают, что маркер находится в общей зоне обзора двух камер.
+        /// Обновляет тонкие линии от камер к маркерам одним общим LinesVisual3D.
+        /// Это заметно дешевле, чем держать отдельный визуальный объект на каждый ID.
         /// </summary>
-        private void CreateOrUpdateMarkerGuideLine(int markerId, Point3D markerPosition)
+        private void UpdateMarkerGuideLines(IReadOnlyDictionary<int, Point3D> currentMarkers)
         {
             if (_scene3DService == null || !_scene3DService.IsCalibrated)
+            {
+                ClearMarkerGuideLines();
+                return;
+            }
+
+            var now = DateTime.UtcNow;
+            if ((now - _lastGuideLinesUpdateTime).TotalMilliseconds < GuideLinesUpdateIntervalMs)
                 return;
 
-            if (!_markerGuideLines.TryGetValue(markerId, out var guideLine))
-            {
-                guideLine = new LinesVisual3D
-                {
-                    Color = Colors.Gray,
-                    Thickness = 1
-                };
+            _lastGuideLinesUpdateTime = now;
 
-                _markerGuideLines[markerId] = guideLine;
-                _viewport3D.Children.Add(guideLine);
-            }
-            else if (!_viewport3D.Children.Contains(guideLine))
+            if (currentMarkers.Count == 0)
             {
-                _viewport3D.Children.Add(guideLine);
+                ClearMarkerGuideLines();
+                return;
             }
 
             var cam1Pos = _scene3DService.Camera1Position;
             var cam2Pos = _scene3DService.Camera2Position;
             var cam1GuideStart = GetCameraLensPoint(cam1Pos);
             var cam2GuideStart = GetCameraLensPoint(cam2Pos);
+            var points = new Point3DCollection(currentMarkers.Count * 4);
 
-            guideLine.Points = new Point3DCollection
+            foreach (var marker in currentMarkers.OrderBy(m => GetMarkerDisplayIndex(m.Key)).ThenBy(m => m.Key))
             {
-                cam1GuideStart,
-                markerPosition,
-                cam2GuideStart,
-                markerPosition
-            };
+                points.Add(cam1GuideStart);
+                points.Add(marker.Value);
+                points.Add(cam2GuideStart);
+                points.Add(marker.Value);
+            }
+
+            _markerGuideLinesVisual.Points = points;
         }
 
         private static Point3D GetCameraLensPoint(Point3D cameraCenter)
@@ -1197,23 +3165,10 @@ namespace StereoCalibration.UI
             return new Point3D(cameraCenter.X, cameraCenter.Y + CameraLensOffset, cameraCenter.Z);
         }
 
-        private void RemoveMarkerGuideLine(int markerId)
-        {
-            if (_markerGuideLines.TryGetValue(markerId, out var guideLine))
-            {
-                _viewport3D.Children.Remove(guideLine);
-                _markerGuideLines.Remove(markerId);
-            }
-        }
-
         private void ClearMarkerGuideLines()
         {
-            foreach (var guideLine in _markerGuideLines.Values)
-            {
-                _viewport3D.Children.Remove(guideLine);
-            }
-
-            _markerGuideLines.Clear();
+            if (_markerGuideLinesVisual.Points.Count > 0)
+                _markerGuideLinesVisual.Points = new Point3DCollection();
         }
 
         /// <summary>
@@ -1231,6 +3186,16 @@ namespace StereoCalibration.UI
             return true;
         }
 
+        private bool ShouldUpdateMarkerText()
+        {
+            var now = DateTime.UtcNow;
+            if ((now - _lastMarkerTextUpdateTime).TotalMilliseconds < MarkerTextUpdateIntervalMs)
+                return false;
+
+            _lastMarkerTextUpdateTime = now;
+            return true;
+        }
+
         /// <summary>
         /// Обновляет полупрозрачную поверхность, проходящую через текущие маркеры.
         /// 
@@ -1241,19 +3206,25 @@ namespace StereoCalibration.UI
         /// </summary>
         private void UpdateMarkerSurface(IReadOnlyDictionary<int, Point3D> currentMarkers)
         {
-            if (currentMarkers.Count < 3)
+            if (_showWoundModelCheckBox.IsChecked == true &&
+                _woundModelService.HasModel &&
+                !IsMarkerSurfaceProjectionMode)
             {
                 ClearMarkerSurface();
                 return;
             }
 
-            if (!ShouldUpdateMarkerSurface(currentMarkers))
+            var surfaceMarkers = GetSurfaceMarkerCandidates(currentMarkers);
+            if (surfaceMarkers.Count < 3)
+            {
+                ClearMarkerSurface();
+                return;
+            }
+
+            if (!ShouldUpdateMarkerSurface(surfaceMarkers))
                 return;
 
-            var markerPoints = currentMarkers
-                .OrderBy(marker => GetMarkerDisplayIndex(marker.Key))
-                .ThenBy(marker => marker.Key)
-                .Take(MaxSurfaceMarkers)
+            var markerPoints = surfaceMarkers
                 .Select(marker => marker.Value)
                 .ToList();
 
@@ -1262,12 +3233,675 @@ namespace StereoCalibration.UI
             _markerSurfaceMesh.TriangleIndices = mesh.TriangleIndices;
 
             _lastSurfaceMarkerSnapshot.Clear();
-            foreach (var marker in currentMarkers)
+            _lastSurfaceMarkerIds.Clear();
+            foreach (var marker in surfaceMarkers)
             {
                 _lastSurfaceMarkerSnapshot[marker.Key] = marker.Value;
+                _lastSurfaceMarkerIds.Add(marker.Key);
             }
 
+            _surfaceTopologyChangeDetectedAt = DateTime.MinValue;
             _lastSurfaceUpdateTime = DateTime.UtcNow;
+        }
+
+        private List<KeyValuePair<int, Point3D>> GetSurfaceMarkerCandidates(IReadOnlyDictionary<int, Point3D> currentMarkers)
+        {
+            return currentMarkers
+                .OrderBy(marker => GetMarkerDisplayIndex(marker.Key))
+                .ThenBy(marker => marker.Key)
+                .Take(MaxSurfaceMarkers)
+                .ToList();
+        }
+
+        private List<KeyValuePair<int, Point3D>> GetTrajectoryMarkerCandidates(IReadOnlyDictionary<int, Point3D> currentMarkers)
+            => GetSurfaceMarkerCandidates(currentMarkers);
+
+        private bool TryGetCurrentWoundMeshSceneSnapshot(
+            out List<Point3D> meshVerticesScene,
+            out List<int> meshTriangles)
+        {
+            meshVerticesScene = new List<Point3D>();
+            meshTriangles = new List<int>();
+
+            if (!_woundModelService.HasMesh || _woundModelService.Mesh == null)
+                return false;
+
+            var mesh = _woundModelService.Mesh;
+            if (mesh.Positions == null || mesh.TriangleIndices == null)
+                return false;
+            if (mesh.Positions.Count < 3 || mesh.TriangleIndices.Count < 3)
+                return false;
+
+            var transformToScene = _scene3DService != null && _scene3DService.IsCalibrated;
+            meshVerticesScene = new List<Point3D>(mesh.Positions.Count);
+            foreach (var point in mesh.Positions)
+            {
+                meshVerticesScene.Add(transformToScene
+                    ? _scene3DService!.ConvertCamera1PointToScene(point)
+                    : point);
+            }
+
+            meshTriangles = mesh.TriangleIndices.ToList();
+            return true;
+        }
+
+        private void UpdateWoundModel()
+        {
+            if (!_woundModelService.HasModel)
+                return;
+
+            // Тот же сглаженный поток TTL, что и MarkerPositions во вьюпорте — иначе меш следует другим XYZ, чем чипы.
+            IReadOnlyDictionary<int, Point3D> markersForWound =
+                _scene3DService != null && _scene3DService.IsCalibrated
+                    ? _scene3DService.MarkerPositionsCamera1Mm
+                    : new Dictionary<int, Point3D>();
+
+            if (_scene3DService != null && _scene3DService.IsCalibrated)
+            {
+                var stereoScene = _scene3DService.StereoCenter;
+                var stereoCamera1 = _scene3DService.ConvertScenePointToCamera1(stereoScene);
+                _woundModelService.SetStereoLookTargetCamera1(stereoCamera1);
+            }
+
+            if (_woundModelService.TryUpdate(markersForWound) && _woundModelService.Mesh != null)
+            {
+                _woundModelMesh = _woundModelService.Mesh;
+            }
+
+            if (_showWoundModelCheckBox.IsChecked == true)
+                ApplyWoundModelMaterial();
+            UpdateWoundModelTransform();
+            UpdateWoundDiagnosticsVisual();
+
+            SetWoundModelStatus(_woundModelService.Status);
+
+            if (_scene3DService != null &&
+                _scene3DService.IsCalibrated &&
+                _woundModelService.HasModel &&
+                ShouldThrottleViewportDiag(ref _lastViewportParityLogUtc, ViewportMarkerParityLogIntervalMs))
+            {
+                WoundDiagnosticsSessionRecorder.Instance.LogViewportMarkerParity(
+                    _scene3DService,
+                    _scene3DService.MarkerPositions,
+                    _scene3DService.MarkerPositionsCamera1Mm,
+                    _scene3DService.MarkerPositionsCamera1RawMm,
+                    _woundModelService.ActiveDeformationMarkerIds);
+            }
+        }
+
+        private static bool ShouldThrottleViewportDiag(ref DateTime lastUtc, int intervalMs)
+        {
+            var now = DateTime.UtcNow;
+            if ((now - lastUtc).TotalMilliseconds < intervalMs)
+                return false;
+            lastUtc = now;
+            return true;
+        }
+
+        private static Point3DCollection BuildPredictedGizmoCrossPoints(Point3D center, double halfExtentMm)
+        {
+            var x = center.X;
+            var y = center.Y;
+            var z = center.Z;
+            return new Point3DCollection(new[]
+            {
+                new Point3D(x - halfExtentMm, y, z), new Point3D(x + halfExtentMm, y, z),
+                new Point3D(x, y - halfExtentMm, z), new Point3D(x, y + halfExtentMm, z),
+                new Point3D(x, y, z - halfExtentMm), new Point3D(x, y, z + halfExtentMm),
+            });
+        }
+
+        private void UpdateWoundDiagnosticsVisual()
+        {
+            if (!_showDeformationDebugOverlay ||
+                _scene3DService == null ||
+                !_scene3DService.IsCalibrated ||
+                _showWoundModelCheckBox.IsChecked != true ||
+                !_woundModelService.HasModel)
+            {
+                _woundMarkerFitDebugVisual.Points = new Point3DCollection();
+                ClearWoundPredictedGizmoVisuals();
+                return;
+            }
+
+            var points = new Point3DCollection();
+            var activeGizmoIds = new HashSet<int>();
+            foreach (var pair in _woundModelService.LastPredictedMarkerPositionsCamera1)
+            {
+                if (!_woundModelService.LastObservedMarkerPositionsCamera1.TryGetValue(pair.Key, out var observedCamera1))
+                    continue;
+
+                var observedScene = _scene3DService.ConvertCamera1PointToScene(observedCamera1);
+                var predictedScene = _scene3DService.ConvertCamera1PointToScene(pair.Value);
+                points.Add(observedScene);
+                points.Add(predictedScene);
+                UpdateWoundPredictedGizmoVisual(pair.Key, predictedScene);
+                activeGizmoIds.Add(pair.Key);
+            }
+
+            RemoveStaleWoundPredictedGizmoVisuals(activeGizmoIds);
+
+            if (TryGetMeshAndMarkerSceneStats(out var meshStatsScene, out var markerStatsScene))
+            {
+                points.Add(markerStatsScene.Center);
+                points.Add(meshStatsScene.Center);
+            }
+
+            _woundMarkerFitDebugVisual.Points = points;
+        }
+
+        private void UpdateWoundPredictedGizmoVisual(int markerId, Point3D position)
+        {
+            if (!_woundPredictedGizmoVisuals.TryGetValue(markerId, out var lines))
+            {
+                lines = new LinesVisual3D
+                {
+                    Color = GetMarkerColor(markerId),
+                    Thickness = 1
+                };
+                _woundPredictedGizmoVisuals[markerId] = lines;
+                _viewport3D.Children.Add(lines);
+            }
+
+            lines.Points = BuildPredictedGizmoCrossPoints(position, PredictedGizmoHalfExtentMm);
+        }
+
+        private void RemoveStaleWoundPredictedGizmoVisuals(IReadOnlySet<int> activeIds)
+        {
+            var staleIds = _woundPredictedGizmoVisuals.Keys
+                .Where(id => !activeIds.Contains(id))
+                .ToList();
+            foreach (var staleId in staleIds)
+            {
+                _viewport3D.Children.Remove(_woundPredictedGizmoVisuals[staleId]);
+                _woundPredictedGizmoVisuals.Remove(staleId);
+            }
+        }
+
+        private void ClearWoundPredictedGizmoVisuals()
+        {
+            foreach (var lines in _woundPredictedGizmoVisuals.Values)
+            {
+                _viewport3D.Children.Remove(lines);
+            }
+
+            _woundPredictedGizmoVisuals.Clear();
+        }
+
+        private bool TryGetMeshAndMarkerCamera1Stats(
+            out PointCloudStats meshStatsCamera1,
+            out PointCloudStats markerStatsCamera1)
+        {
+            meshStatsCamera1 = default;
+            markerStatsCamera1 = default;
+
+            if (_scene3DService == null ||
+                !_woundModelService.HasMesh ||
+                _woundModelService.Mesh?.Positions == null ||
+                _woundModelService.Mesh.Positions.Count == 0)
+            {
+                return false;
+            }
+
+            var activeMarkerIds = _woundModelService.LastObservedMarkerPositionsCamera1.Count > 0
+                ? _woundModelService.LastObservedMarkerPositionsCamera1.Keys.ToHashSet()
+                : _scene3DService.MarkerPositionsCamera1Mm.Keys.ToHashSet();
+            var markerPoints = _scene3DService.MarkerPositionsCamera1Mm
+                .Where(marker => activeMarkerIds.Contains(marker.Key))
+                .Select(marker => marker.Value)
+                .ToList();
+
+            if (markerPoints.Count == 0)
+                return false;
+
+            meshStatsCamera1 = CalculatePointCloudStats(_woundModelService.Mesh.Positions);
+            markerStatsCamera1 = CalculatePointCloudStats(markerPoints);
+            return true;
+        }
+
+        private bool TryGetMeshAndMarkerSceneStats(
+            out PointCloudStats meshStatsScene,
+            out PointCloudStats markerStatsScene)
+        {
+            meshStatsScene = default;
+            markerStatsScene = default;
+
+            if (_scene3DService == null ||
+                !_scene3DService.IsCalibrated ||
+                !_woundModelService.HasMesh ||
+                _woundModelService.Mesh?.Positions == null ||
+                _woundModelService.Mesh.Positions.Count == 0)
+            {
+                return false;
+            }
+
+            var activeMarkerIds = _woundModelService.LastObservedMarkerPositionsCamera1.Count > 0
+                ? _woundModelService.LastObservedMarkerPositionsCamera1.Keys.ToHashSet()
+                : _scene3DService.MarkerPositions.Keys.ToHashSet();
+            var markerPoints = _scene3DService.MarkerPositions
+                .Where(marker => activeMarkerIds.Contains(marker.Key))
+                .Select(marker => marker.Value)
+                .ToList();
+
+            if (markerPoints.Count == 0)
+                return false;
+
+            var meshPointsScene = _woundModelService.Mesh.Positions
+                .Select(point => _scene3DService.ConvertCamera1PointToScene(point))
+                .ToList();
+            meshStatsScene = CalculatePointCloudStats(meshPointsScene);
+            markerStatsScene = CalculatePointCloudStats(markerPoints);
+            return true;
+        }
+
+        private static PointCloudStats CalculatePointCloudStats(IEnumerable<Point3D> points)
+        {
+            var pointList = points.ToList();
+            if (pointList.Count == 0)
+                return new PointCloudStats(new Point3D(), new Vector3D(), 0);
+
+            var minX = pointList.Min(point => point.X);
+            var maxX = pointList.Max(point => point.X);
+            var minY = pointList.Min(point => point.Y);
+            var maxY = pointList.Max(point => point.Y);
+            var minZ = pointList.Min(point => point.Z);
+            var maxZ = pointList.Max(point => point.Z);
+            var center = new Point3D(
+                (minX + maxX) / 2.0,
+                (minY + maxY) / 2.0,
+                (minZ + maxZ) / 2.0);
+            var size = new Vector3D(maxX - minX, maxY - minY, maxZ - minZ);
+            return new PointCloudStats(center, size, pointList.Count);
+        }
+
+        private static double VectorLength(Vector3D vector)
+        {
+            return Math.Sqrt(vector.X * vector.X + vector.Y * vector.Y + vector.Z * vector.Z);
+        }
+
+        private string? TryWriteWoundDiagnosticsFile()
+        {
+            if (_scene3DService == null || !_woundModelService.HasModel)
+                return null;
+
+            var path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "wound_diagnostics_latest.txt");
+            if (_scene3DService.LastTriangulatedFreshMarkerCount == 0 ||
+                _scene3DService.MarkerPositionsCamera1RawMm.Count == 0)
+            {
+                return File.Exists(path) ? path : null;
+            }
+
+            var now = DateTime.UtcNow;
+            if ((now - _lastWoundDiagnosticsWriteTime).TotalMilliseconds < WoundDiagnosticsFileWriteIntervalMs)
+            {
+                return path;
+            }
+
+            _lastWoundDiagnosticsWriteTime = now;
+            try
+            {
+                File.WriteAllText(path, BuildWoundDiagnosticsReport(now));
+                File.WriteAllText(
+                    Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "wound_diagnostics_latest.json"),
+                    JsonConvert.SerializeObject(BuildWoundDiagnosticsJson(now), Formatting.Indented));
+                return path;
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"Ошибка записи wound diagnostics: {ex.Message}");
+                return null;
+            }
+        }
+
+        private string BuildWoundDiagnosticsReport(DateTime nowUtc)
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("StereoCalibration wound diagnostics");
+            sb.AppendLine($"utc: {nowUtc:O}");
+            sb.AppendLine($"calibrated: {_scene3DService?.IsCalibrated}");
+            sb.AppendLine($"freshStereoMarkers: {_scene3DService?.LastTriangulatedFreshMarkerCount}");
+            sb.AppendLine($"sceneMarkers: {_scene3DService?.MarkerPositions.Count}");
+            sb.AppendLine();
+
+            AppendPoint(sb, "camera1.scene", _scene3DService?.Camera1Position ?? default);
+            AppendPoint(sb, "camera2.scene", _scene3DService?.Camera2Position ?? default);
+            AppendPoint(sb, "stereoCenter.scene", _scene3DService?.StereoCenter ?? default);
+            sb.AppendLine();
+
+            sb.AppendLine("[wound-status]");
+            sb.AppendLine($"loadedFile: {_woundModelService.LoadedFileName}");
+            sb.AppendLine($"status: {_woundModelService.Status}");
+            sb.AppendLine($"referenceReason: {_woundModelService.LastReferenceReason}");
+            sb.AppendLine($"linkedMarkers: {_woundModelService.LinkedMarkerCount}");
+            sb.AppendLine($"activeMarkers: {_woundModelService.ActiveMarkerCount}");
+            sb.AppendLine($"visibleActiveMarkers: {_woundModelService.LastVisibleActiveMarkerCount}");
+            sb.AppendLine($"fallbackMarkers: {_woundModelService.LastFallbackMarkerCount}");
+            sb.AppendLine($"alignRmseMm: {_woundModelService.LastAlignmentRmseMm:F6}");
+            sb.AppendLine($"fitRmseMm: {_woundModelService.LastMarkerFitRmseMm:F6}");
+            sb.AppendLine($"fitMaxMm: {_woundModelService.LastMarkerFitMaxMm:F6}");
+            sb.AppendLine($"fitWorstMarkerId: {_woundModelService.LastMarkerFitWorstMarkerId}");
+            sb.AppendLine($"activeScaleMode: {_woundModelService.ActiveModelScaleMode}");
+            sb.AppendLine($"activeScaleMultiplier: {_woundModelService.ActiveModelScaleMultiplier:F9}");
+            sb.AppendLine($"captureCombinedScale: {_woundModelService.LastCaptureCombinedScale:F9}");
+            AppendVector(sb, "captureTranslationMm", _woundModelService.LastCaptureTranslationMm);
+            sb.AppendLine($"referenceMarkerBiasRmseMm: {_woundModelService.LastReferenceMarkerBiasRmseMm:F6}");
+            sb.AppendLine($"globalCorrectionApplied: {_woundModelService.LastGlobalCorrectionApplied}");
+            sb.AppendLine($"globalCorrectionScale: {_woundModelService.LastGlobalCorrectionScale:F9}");
+            sb.AppendLine($"globalCorrectionTranslationNormMm: {_woundModelService.LastGlobalCorrectionTranslationNormMm:F6}");
+            sb.AppendLine();
+
+            AppendStatsSection(sb, "referenceMesh.model", _woundModelService.TryGetReferenceMeshStats, null);
+            AppendStatsSection(sb, "modelMarkers.model", _woundModelService.TryGetModelMarkerStats, null);
+            if (_woundModelService.TryGetReferenceMeshStats(out var refMeshCenter, out _, out _) &&
+                _woundModelService.TryGetModelMarkerStats(out var refMarkerCenter, out _, out _))
+            {
+                sb.AppendLine($"referenceMesh_to_modelMarkers_centerDistanceMm: {Distance(refMeshCenter, refMarkerCenter):F6}");
+            }
+
+            if (TryGetMeshAndMarkerCamera1Stats(out var meshCamera1Stats, out var markerCamera1Stats))
+            {
+                AppendStats(sb, "mesh.camera1", meshCamera1Stats);
+                AppendStats(sb, "activeMarkers.camera1", markerCamera1Stats);
+                sb.AppendLine($"mesh_to_activeMarkers_camera1_centerDistanceMm: {Distance(meshCamera1Stats.Center, markerCamera1Stats.Center):F6}");
+            }
+
+            if (TryGetMeshAndMarkerSceneStats(out var meshSceneStats, out var markerSceneStats))
+            {
+                AppendStats(sb, "mesh.scene", meshSceneStats);
+                AppendStats(sb, "activeMarkers.scene", markerSceneStats);
+                sb.AppendLine($"mesh_to_activeMarkers_scene_centerDistanceMm: {Distance(meshSceneStats.Center, markerSceneStats.Center):F6}");
+            }
+
+            sb.AppendLine();
+            sb.AppendLine("[marker-pairs]");
+            sb.AppendLine("id;observed.camera1;predicted.camera1;observed.scene;predicted.scene;residual.mm");
+            foreach (var marker in _woundModelService.LastPredictedMarkerPositionsCamera1.OrderBy(item => item.Key))
+            {
+                if (!_woundModelService.LastObservedMarkerPositionsCamera1.TryGetValue(marker.Key, out var observedCamera1))
+                    continue;
+
+                _woundModelService.LastMarkerFitByIdMm.TryGetValue(marker.Key, out var residual);
+                var observedScene = _scene3DService != null && _scene3DService.IsCalibrated
+                    ? _scene3DService.ConvertCamera1PointToScene(observedCamera1)
+                    : observedCamera1;
+                var predictedScene = _scene3DService != null && _scene3DService.IsCalibrated
+                    ? _scene3DService.ConvertCamera1PointToScene(marker.Value)
+                    : marker.Value;
+                sb.AppendLine(
+                    $"{marker.Key};{FormatPoint(observedCamera1)};{FormatPoint(marker.Value)};" +
+                    $"{FormatPoint(observedScene)};{FormatPoint(predictedScene)};{residual:F6}");
+            }
+
+            sb.AppendLine();
+            sb.AppendLine("[all-scene-markers]");
+            sb.AppendLine("id;camera1;scene");
+            if (_scene3DService != null)
+            {
+                foreach (var marker in _scene3DService.MarkerPositionsCamera1Mm.OrderBy(item => item.Key))
+                {
+                    _scene3DService.MarkerPositions.TryGetValue(marker.Key, out var scenePoint);
+                    sb.AppendLine($"{marker.Key};{FormatPoint(marker.Value)};{FormatPoint(scenePoint)}");
+                }
+            }
+
+            return sb.ToString();
+        }
+
+        private object BuildWoundDiagnosticsJson(DateTime nowUtc)
+        {
+            PointCloudStats? meshCamera1Stats = null;
+            PointCloudStats? markerCamera1Stats = null;
+            PointCloudStats? meshSceneStats = null;
+            PointCloudStats? markerSceneStats = null;
+            if (TryGetMeshAndMarkerCamera1Stats(out var meshCamera1, out var markerCamera1))
+            {
+                meshCamera1Stats = meshCamera1;
+                markerCamera1Stats = markerCamera1;
+            }
+
+            if (TryGetMeshAndMarkerSceneStats(out var meshScene, out var markerScene))
+            {
+                meshSceneStats = meshScene;
+                markerSceneStats = markerScene;
+            }
+
+            _woundModelService.TryGetReferenceMeshStats(out var referenceMeshCenter, out var referenceMeshSize, out var referenceMeshCount);
+            _woundModelService.TryGetModelMarkerStats(out var modelMarkerCenter, out var modelMarkerSize, out var modelMarkerCount);
+
+            var markerPairs = _woundModelService.LastPredictedMarkerPositionsCamera1
+                .OrderBy(item => item.Key)
+                .Select(item =>
+                {
+                    if (!_woundModelService.LastObservedMarkerPositionsCamera1.TryGetValue(item.Key, out var observedCamera1))
+                        return null;
+
+                    _woundModelService.LastMarkerFitByIdMm.TryGetValue(item.Key, out var residual);
+                    var observedScene = _scene3DService != null && _scene3DService.IsCalibrated
+                        ? _scene3DService.ConvertCamera1PointToScene(observedCamera1)
+                        : observedCamera1;
+                    var predictedScene = _scene3DService != null && _scene3DService.IsCalibrated
+                        ? _scene3DService.ConvertCamera1PointToScene(item.Value)
+                        : item.Value;
+
+                    return new
+                    {
+                        id = item.Key,
+                        observedCamera1 = ToJsonPoint(observedCamera1),
+                        predictedCamera1 = ToJsonPoint(item.Value),
+                        observedScene = ToJsonPoint(observedScene),
+                        predictedScene = ToJsonPoint(predictedScene),
+                        residualMm = residual
+                    };
+                })
+                .Where(item => item != null)
+                .ToArray();
+
+            return new
+            {
+                utc = nowUtc,
+                calibrated = _scene3DService?.IsCalibrated ?? false,
+                freshStereoMarkers = _scene3DService?.LastTriangulatedFreshMarkerCount ?? 0,
+                sceneMarkers = _scene3DService?.MarkerPositions.Count ?? 0,
+                wound = new
+                {
+                    loadedFile = _woundModelService.LoadedFileName,
+                    status = _woundModelService.Status,
+                    referenceReason = _woundModelService.LastReferenceReason,
+                    linkedMarkers = _woundModelService.LinkedMarkerCount,
+                    activeMarkers = _woundModelService.ActiveMarkerCount,
+                    visibleActiveMarkers = _woundModelService.LastVisibleActiveMarkerCount,
+                    fallbackMarkers = _woundModelService.LastFallbackMarkerCount,
+                    frameFrozen = _woundModelService.LastFrameFrozen,
+                    freezeReason = _woundModelService.LastFreezeReason,
+                    rigidRmseMm = _woundModelService.LastRigidRmseMm,
+                    residualMaxMm = _woundModelService.LastResidualMaxMm,
+                    residualP95Mm = _woundModelService.LastResidualP95Mm,
+                    outlierMarkerCount = _woundModelService.LastOutlierMarkerCount,
+                    alignRmseMm = _woundModelService.LastAlignmentRmseMm,
+                    fitRmseMm = _woundModelService.LastMarkerFitRmseMm,
+                    fitMaxMm = _woundModelService.LastMarkerFitMaxMm,
+                    fitWorstMarkerId = _woundModelService.LastMarkerFitWorstMarkerId,
+                    activeScaleMode = _woundModelService.ActiveModelScaleMode,
+                    activeScaleMultiplier = _woundModelService.ActiveModelScaleMultiplier,
+                    captureCombinedScale = _woundModelService.LastCaptureCombinedScale,
+                    captureTranslationMm = ToJsonVector(_woundModelService.LastCaptureTranslationMm),
+                    referenceMarkerBiasRmseMm = _woundModelService.LastReferenceMarkerBiasRmseMm,
+                    currentSurfaceNormalCamera1 = ToJsonVector(_woundModelService.LastSurfaceNormalCamera1)
+                },
+                referenceMeshModel = ToJsonStats(referenceMeshCenter, referenceMeshSize, referenceMeshCount),
+                modelMarkersModel = ToJsonStats(modelMarkerCenter, modelMarkerSize, modelMarkerCount),
+                meshCamera1 = meshCamera1Stats.HasValue ? ToJsonStats(meshCamera1Stats.Value) : null,
+                activeMarkersCamera1 = markerCamera1Stats.HasValue ? ToJsonStats(markerCamera1Stats.Value) : null,
+                meshScene = meshSceneStats.HasValue ? ToJsonStats(meshSceneStats.Value) : null,
+                activeMarkersScene = markerSceneStats.HasValue ? ToJsonStats(markerSceneStats.Value) : null,
+                markerPairs
+            };
+        }
+
+        private static object ToJsonStats(PointCloudStats stats)
+        {
+            return ToJsonStats(stats.Center, stats.Size, stats.Count);
+        }
+
+        private static object ToJsonStats(Point3D center, Vector3D size, int count)
+        {
+            return new
+            {
+                count,
+                center = ToJsonPoint(center),
+                size = ToJsonVector(size)
+            };
+        }
+
+        private static object ToJsonPoint(Point3D point)
+        {
+            return new { x = point.X, y = point.Y, z = point.Z };
+        }
+
+        private static object ToJsonVector(Vector3D vector)
+        {
+            return new { x = vector.X, y = vector.Y, z = vector.Z, length = VectorLength(vector) };
+        }
+
+        private static void AppendStatsSection(
+            StringBuilder sb,
+            string name,
+            TryGetStatsDelegate tryGetStats,
+            string? suffix)
+        {
+            if (tryGetStats(out var center, out var size, out var count))
+            {
+                AppendStats(sb, suffix == null ? name : $"{name}.{suffix}", new PointCloudStats(center, size, count));
+            }
+        }
+
+        private static void AppendStats(StringBuilder sb, string name, PointCloudStats stats)
+        {
+            sb.AppendLine($"[{name}]");
+            sb.AppendLine($"count: {stats.Count}");
+            AppendPoint(sb, "center", stats.Center);
+            AppendVector(sb, "size", stats.Size);
+        }
+
+        private static void AppendPoint(StringBuilder sb, string name, Point3D point)
+        {
+            sb.AppendLine($"{name}: {FormatPoint(point)}");
+        }
+
+        private static void AppendVector(StringBuilder sb, string name, Vector3D vector)
+        {
+            sb.AppendLine($"{name}: ({vector.X:F6}, {vector.Y:F6}, {vector.Z:F6}), length={VectorLength(vector):F6}");
+        }
+
+        private static string FormatPoint(Point3D point)
+        {
+            return $"({point.X:F6}, {point.Y:F6}, {point.Z:F6})";
+        }
+
+        private delegate bool TryGetStatsDelegate(out Point3D center, out Vector3D size, out int count);
+
+        private readonly struct PointCloudStats
+        {
+            public PointCloudStats(Point3D center, Vector3D size, int count)
+            {
+                Center = center;
+                Size = size;
+                Count = count;
+            }
+
+            public Point3D Center { get; }
+            public Vector3D Size { get; }
+            public int Count { get; }
+        }
+
+        private void TryRebuildProjectedTrajectory(IReadOnlyDictionary<int, Point3D> currentMarkers)
+        {
+            if (_parsedGCodePath == null ||
+                !HasActivePrintReference ||
+                _scene3DService == null ||
+                !_scene3DService.IsCalibrated)
+                return;
+
+            var surfaceMarkers = GetTrajectoryMarkerCandidates(currentMarkers);
+
+            if (_surfacePrintReference != null)
+            {
+                if (surfaceMarkers.Count < SurfaceProjectionService.MinMarkersForDeformation)
+                {
+                    HandleInvalidSurface(
+                        $"Режим маркеров: нужно минимум {SurfaceProjectionService.MinMarkersForDeformation} точек для перестроения, сейчас {surfaceMarkers.Count}.");
+                    return;
+                }
+            }
+            else
+            {
+                _lastDeformationMarkerCount = Math.Max(0, _woundModelService.ActiveMarkerCount);
+                if (_lastDeformationMarkerCount < MinMarkersForWoundMeshDeformation)
+                {
+                    HandleInvalidSurface(
+                        $"Для деформации модели нужно минимум {MinMarkersForWoundMeshDeformation} связ. маркеров, сейчас {_lastDeformationMarkerCount}.");
+                    return;
+                }
+
+                if (!_woundModelService.HasModel || !_woundModelService.HasMesh)
+                {
+                    HandleInvalidSurface("Модель раны не загружена или mesh недоступен.");
+                    return;
+                }
+
+                if (!TryGetCurrentWoundMeshSceneSnapshot(out _, out _))
+                {
+                    HandleInvalidSurface("Не удалось получить текущий деформированный mesh.");
+                    return;
+                }
+            }
+
+            if (!ShouldRebuildProjectedTrajectory(surfaceMarkers))
+                return;
+
+            RequestTrajectoryProjection(
+                surfaceMarkers,
+                preservePlaybackState: true,
+                rebuildReason: _isPausedByInvalidSurface
+                    ? "Автовосстановление после freeze"
+                    : "Смещение маркеров");
+        }
+
+        private bool ShouldRebuildProjectedTrajectory(IReadOnlyList<KeyValuePair<int, Point3D>> surfaceMarkers)
+        {
+            if (_parsedGCodePath == null)
+                return false;
+
+            if (!HasActivePrintReference)
+                return false;
+
+            var now = DateTime.UtcNow;
+            if ((now - _lastTrajectoryRebuildTime).TotalMilliseconds < TrajectoryRebuildIntervalMs)
+                return false;
+
+            if (_isPausedByInvalidSurface)
+                return true;
+
+            if (_projectedPrintPath == null)
+                return true;
+
+            if (_lastTrajectoryMarkerSnapshot.Count != surfaceMarkers.Count)
+                return true;
+
+            var movementThreshold = _printTrajectoryService.IsRunning
+                ? TrajectoryRunningRebuildThresholdMm
+                : TrajectoryRebuildThresholdMm;
+
+            foreach (var marker in surfaceMarkers)
+            {
+                if (!_lastTrajectoryMarkerSnapshot.TryGetValue(marker.Key, out var previousPosition))
+                    return true;
+
+                if (Distance(previousPosition, marker.Value) >= movementThreshold)
+                    return true;
+            }
+
+            return false;
         }
 
         /// <summary>
@@ -1277,13 +3911,30 @@ namespace StereoCalibration.UI
         /// сдвинулись меньше порога. Дополнительно действует временной интервал,
         /// чтобы поверхность не потребляла много ресурсов при небольшом шуме.
         /// </summary>
-        private bool ShouldUpdateMarkerSurface(IReadOnlyDictionary<int, Point3D> currentMarkers)
+        private bool ShouldUpdateMarkerSurface(IReadOnlyList<KeyValuePair<int, Point3D>> surfaceMarkers)
         {
-            if (_lastSurfaceMarkerSnapshot.Count != currentMarkers.Count)
-                return true;
+            var now = DateTime.UtcNow;
+            var currentSurfaceIds = surfaceMarkers.Select(marker => marker.Key).ToHashSet();
+            var topologyChanged = !_lastSurfaceMarkerIds.SetEquals(currentSurfaceIds);
+            if (topologyChanged)
+            {
+                if (_lastSurfaceMarkerSnapshot.Count == 0)
+                    return true;
+
+                if (_surfaceTopologyChangeDetectedAt == DateTime.MinValue)
+                {
+                    _surfaceTopologyChangeDetectedAt = now;
+                    return false;
+                }
+
+                if ((now - _surfaceTopologyChangeDetectedAt).TotalMilliseconds < SurfaceTopologyStabilizationMs)
+                    return false;
+
+                return (now - _lastSurfaceUpdateTime).TotalMilliseconds >= SurfaceUpdateIntervalMs;
+            }
 
             bool hasSignificantChange = false;
-            foreach (var marker in currentMarkers)
+            foreach (var marker in surfaceMarkers)
             {
                 if (!_lastSurfaceMarkerSnapshot.TryGetValue(marker.Key, out var previousPosition))
                     return true;
@@ -1298,7 +3949,7 @@ namespace StereoCalibration.UI
             if (!hasSignificantChange)
                 return false;
 
-            return (DateTime.UtcNow - _lastSurfaceUpdateTime).TotalMilliseconds >= SurfaceUpdateIntervalMs;
+            return (now - _lastSurfaceUpdateTime).TotalMilliseconds >= SurfaceUpdateIntervalMs;
         }
 
         private void ClearMarkerSurface()
@@ -1309,6 +3960,8 @@ namespace StereoCalibration.UI
             _markerSurfaceMesh.Positions = new Point3DCollection();
             _markerSurfaceMesh.TriangleIndices = new Int32Collection();
             _lastSurfaceMarkerSnapshot.Clear();
+            _lastSurfaceMarkerIds.Clear();
+            _surfaceTopologyChangeDetectedAt = DateTime.MinValue;
         }
 
         /// <summary>
@@ -1533,9 +4186,9 @@ namespace StereoCalibration.UI
             return _scene3DService?.GetMarkerDisplayName(markerId) ?? "Маркер ?";
         }
 
-        private string GetMarkerLabel(int markerId)
+        private static string BuildMarkerHudText(int markerId, Point3D position, string displayNameLine)
         {
-            return $"{GetMarkerName(markerId)} (ID {markerId})";
+            return $"ArUco {markerId}\n({position.X:F0}, {position.Y:F0}, {position.Z:F0}) мм\n{displayNameLine}";
         }
 
         private void AddMarkerDataSorted(MarkerCoordinate marker)
@@ -1573,6 +4226,15 @@ namespace StereoCalibration.UI
             }
         }
 
+        private static Point3D Lerp(Point3D from, Point3D to, double alpha)
+        {
+            var clampedAlpha = Math.Max(0, Math.Min(1, alpha));
+            return new Point3D(
+                from.X + (to.X - from.X) * clampedAlpha,
+                from.Y + (to.Y - from.Y) * clampedAlpha,
+                from.Z + (to.Z - from.Z) * clampedAlpha);
+        }
+
         private static double Distance(Point3D a, Point3D b)
         {
             var dx = a.X - b.X;
@@ -1585,7 +4247,7 @@ namespace StereoCalibration.UI
         /// <summary>
         /// Обновление информационной панели
         /// </summary>
-        private void UpdateInfoPanel()
+        private void UpdateInfoPanel(bool force = false)
         {
             if (_scene3DService == null)
                 return;
@@ -1593,7 +4255,7 @@ namespace StereoCalibration.UI
             try
             {
                 var now = DateTime.UtcNow;
-                if ((now - _lastInfoPanelUpdateTime).TotalMilliseconds < InfoPanelUpdateIntervalMs)
+                if (!force && (now - _lastInfoPanelUpdateTime).TotalMilliseconds < InfoPanelUpdateIntervalMs)
                     return;
 
                 _lastInfoPanelUpdateTime = now;
@@ -1612,6 +4274,56 @@ namespace StereoCalibration.UI
                     info += $"📹 Камера 2: ({cam2.X:F0}, {cam2.Y:F0}, {cam2.Z:F0}) мм\n";
                     info += $"🎯 Центр: ({center.X:F0}, {center.Y:F0}, {center.Z:F0}) мм\n";
                     info += $"🎯 Маркеров: {_scene3DService.MarkerPositions.Count}\n\n";
+                    info += $"🧷 Fresh stereo markers: {_scene3DService.LastTriangulatedFreshMarkerCount}\n\n";
+
+                    if (_woundModelService.HasModel)
+                    {
+                        info += "Live trace JSONL: " +
+                            Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "wound_deformation_live_trace.jsonl") + "\n";
+                        info += $"Модель раны: {_woundModelService.LoadedFileName}\n";
+                        info += $"Wound active: {_woundModelService.LastVisibleActiveMarkerCount}/{_woundModelService.ActiveMarkerCount}, fallback {_woundModelService.LastFallbackMarkerCount}\n";
+                        info += $"Rigid RMSE: {_woundModelService.LastRigidRmseMm:F1} мм, residual max {_woundModelService.LastResidualMaxMm:F1} мм\n";
+                        info += $"Fit: {_woundModelService.LastMarkerFitRmseMm:F2}/{_woundModelService.LastMarkerFitMaxMm:F2} мм, align {_woundModelService.LastAlignmentRmseMm:F1} мм\n";
+                        info += _woundModelService.LastFrameFrozen
+                            ? $"Freeze: {_woundModelService.LastFreezeReason}\n"
+                            : $"Deform: OK, outliers {_woundModelService.LastOutlierMarkerCount}\n";
+                        var diagnosticsPath = TryWriteWoundDiagnosticsFile();
+                        if (!string.IsNullOrWhiteSpace(diagnosticsPath))
+                        {
+                            info += $"Diag file: {Path.GetFileName(diagnosticsPath)}\n";
+                        }
+                        info += string.IsNullOrWhiteSpace(_woundModelService.ActiveTexturePath)
+                            ? "Wound texture: fallback material\n\n"
+                            : $"Wound texture: {Path.GetFileName(_woundModelService.ActiveTexturePath)}\n\n";
+                    }
+
+                    if (_parsedGCodePath != null)
+                    {
+                        info += $"🧾 G-code: {_loadedGCodeFileName}\n";
+                        info += $"🛤️ Move: {_parsedGCodePath.Moves.Count}, печать: {_parsedGCodePath.ExtrusionMoves.Count}\n";
+                        info += $"🧠 Деформация: {_deformationStatus}\n";
+                        info += $"📌 Маркеры деформации модели: {_lastDeformationMarkerCount}/{MinMarkersForWoundMeshDeformation}+\n";
+                        info += $"🛡 No-penetration: clearance {ActiveProjectionSafetyClearanceMm:F1} мм\n";
+                        info += _isPausedByInvalidSurface
+                            ? "⛔ Автопауза активна\n"
+                            : "✅ Геометрия валидна\n";
+                        if (_showDeformationDebugOverlay)
+                        {
+                            info += "🧭 Debug overlay: ON\n";
+                        }
+
+                        if (_projectedPrintPath != null)
+                        {
+                            info += $"🖨️ Прогресс: {_printTrajectoryService.NormalizedProgress * 100:F1}%\n";
+                            info += _printTrajectoryService.IsRunning
+                                ? "▶ Печать активна\n\n"
+                                : "⏸ Печать остановлена/пауза\n\n";
+                        }
+                        else
+                        {
+                            info += "⏳ Траектория ожидает проекцию\n\n";
+                        }
+                    }
                 }
                 else
                 {
@@ -1645,6 +4357,9 @@ namespace StereoCalibration.UI
                     _scene3DService.OnSceneUpdated -= UpdateScene;
                 }
 
+                _printTimer.Stop();
+                _printTimer.Tick -= PrintTimer_Tick;
+
                 // Очищаем маркеры
                 foreach (var visual in _markerVisuals.Values)
                 {
@@ -1661,6 +4376,11 @@ namespace StereoCalibration.UI
 
                 ClearMarkerGuideLines();
                 ClearMarkerSurface();
+                ClearWoundPredictedGizmoVisuals();
+                _woundMarkerFitDebugVisual.Points = new Point3DCollection();
+                _woundModelMesh.Positions = new Point3DCollection();
+                _woundModelMesh.TriangleIndices = new Int32Collection();
+                ClearTrajectoryVisuals(keepParsedPath: false);
 
                 // Очищаем таблицу координат
                 _markersData?.Clear();

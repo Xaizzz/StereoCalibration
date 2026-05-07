@@ -186,14 +186,14 @@ namespace StereoCalibration.Controllers
                 // ArUco-детект выполняется на кадрах сервиса, а рисование — на
                 // клонах fr1/fr2, чтобы не портить исходные Mat, используемые
                 // для сохранения калибровочных пар.
-                var (corners1, corners2, ids1, ids2) = _stereoCameraService.DetectArucoMarkers();
+                var (corners1, corners2, ids1, ids2, staleIds1, staleIds2) = _stereoCameraService.DetectArucoMarkers();
                 _stereoCameraService.DrawArucoMarkers(fr1, fr2, corners1, corners2, ids1, ids2);
 
                 // Триангуляция ArUco маркеров
                 if (_calibrationResult != null)
                 {
                     _imageProcessingService.TriangulateArucoMarkers(fr1, fr2, corners1, corners2, 
-                        ids1, ids2, _calibrationResult);
+                        ids1, ids2, _calibrationResult, staleIds1, staleIds2);
                 }
 
                 // Обнаружение шахматной доски

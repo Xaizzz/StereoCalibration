@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Linq;
 using OpenCvSharp;
 using OpenCvSharp.Aruco;
+using System.Windows.Media.Media3D;
 
 namespace StereoCalibration.Services
 {
@@ -27,6 +29,15 @@ namespace StereoCalibration.Services
 
         private readonly Dictionary _dictionary;
         private readonly DetectorParameters _detectorParameters;
+        private readonly Dictionary<int, Point3D> _lastAcceptedMarkerPositions = new Dictionary<int, Point3D>();
+        private readonly Dictionary<int, int> _lastAcceptedMarkerFrame = new Dictionary<int, int>();
+        private int _frameIndex;
+
+        private const double MinDepthMm = 30.0;
+        private const double MaxDepthMm = 5000.0;
+        private const double MaxMarkerJumpMm = 220.0;
+        private const int MaxFramesForJumpCheck = 8;
+        private const double MaxReasonableCoordinateAbsMm = 20000.0;
         
         public ImageProcessingService()
         {
@@ -46,10 +57,14 @@ namespace StereoCalibration.Services
         public void TriangulateArucoMarkers(Mat frame1, Mat frame2, 
             Point2f[][]? cornersAruco1, Point2f[][]? cornersAruco2,
             int[]? idsAruco1, int[]? idsAruco2,
-            Services.CalibrationResult calibrationResult)
+            Services.CalibrationResult calibrationResult,
+            IReadOnlyCollection<int>? staleIdsCamera1 = null,
+            IReadOnlyCollection<int>? staleIdsCamera2 = null)
         {
             if (calibrationResult == null)
                 return;
+
+            _frameIndex++;
 
             if (cornersAruco1 == null || cornersAruco2 == null ||
                 idsAruco1 == null || idsAruco2 == null || idsAruco1.Length == 0 || idsAruco2.Length == 0)
@@ -62,21 +77,39 @@ namespace StereoCalibration.Services
             {
                 Debug.WriteLine($"=== НАЧАЛО ТРИАНГУЛЯЦИИ ===");
                 Debug.WriteLine($"Найдено маркеров: камера 1 - {idsAruco1.Length}, камера 2 - {idsAruco2.Length}");
-                
+                var staleIds1 = staleIdsCamera1 == null
+                    ? new HashSet<int>()
+                    : new HashSet<int>(staleIdsCamera1);
+                var staleIds2 = staleIdsCamera2 == null
+                    ? new HashSet<int>()
+                    : new HashSet<int>(staleIdsCamera2);
+                var rejectedByStale = 0;
+                var rejectedByValidation = 0;
+
                 // Сопоставление маркеров по ID. Триангуляция возможна только для
                 // одного и того же физического маркера, найденного в обеих камерах.
                 Dictionary<int, (Point2f[] left, Point2f[] right)> matchedMarkers = new Dictionary<int, (Point2f[], Point2f[])>();
+                var rightIndexById = new Dictionary<int, int>();
+                for (int j = 0; j < idsAruco2.Length; j++)
+                {
+                    if (!rightIndexById.ContainsKey(idsAruco2[j]))
+                        rightIndexById[idsAruco2[j]] = j;
+                }
+
                 for (int i = 0; i < idsAruco1.Length; i++)
                 {
-                    for (int j = 0; j < idsAruco2.Length; j++)
+                    if (!rightIndexById.TryGetValue(idsAruco1[i], out var rightIndex))
+                        continue;
+
+                    var markerId = idsAruco1[i];
+                    if (staleIds1.Contains(markerId) || staleIds2.Contains(markerId))
                     {
-                        if (idsAruco1[i] == idsAruco2[j])
-                        {
-                            matchedMarkers[idsAruco1[i]] = (cornersAruco1[i], cornersAruco2[j]);
-                            Debug.WriteLine($"Найдено совпадение маркера ID {idsAruco1[i]}");
-                            break;
-                        }
+                        rejectedByStale++;
+                        continue;
                     }
+
+                    matchedMarkers[markerId] = (cornersAruco1[i], cornersAruco2[rightIndex]);
+                    Debug.WriteLine($"Найдено совпадение маркера ID {markerId}");
                 }
                 
                 Debug.WriteLine($"Сопоставленных маркеров: {matchedMarkers.Count}");
@@ -99,11 +132,23 @@ namespace StereoCalibration.Services
                         cameraMatrix1Mat, cameraMatrix2Mat, distCoeffs1Mat, distCoeffs2Mat,
                         calibrationResult, frame1, frame2, out var position))
                     {
+                        if (!TryValidateTriangulatedMarker(marker.Key, position, out var rejectionReason))
+                        {
+                            rejectedByValidation++;
+                            Debug.WriteLine($"Маркер ID {marker.Key} отброшен после триангуляции: {rejectionReason}");
+                            continue;
+                        }
+
                         triangulatedMarkers[marker.Key] = position;
+                        _lastAcceptedMarkerPositions[marker.Key] = new Point3D(position.X, position.Y, position.Z);
+                        _lastAcceptedMarkerFrame[marker.Key] = _frameIndex;
                     }
                 }
 
                 OnMarkerPositions3DUpdated?.Invoke(triangulatedMarkers);
+                PruneHistory();
+                Debug.WriteLine(
+                    $"Фильтр триангуляции: stale={rejectedByStale}, invalid={rejectedByValidation}, accepted={triangulatedMarkers.Count}");
                 
                 Debug.WriteLine($"=== КОНЕЦ ТРИАНГУЛЯЦИИ ===");
                 
@@ -119,6 +164,73 @@ namespace StereoCalibration.Services
             {
                 Debug.WriteLine($"ОШИБКА В ТРИАНГУЛЯЦИИ: {ex.Message}");
                 Debug.WriteLine($"Stack trace: {ex.StackTrace}");
+            }
+        }
+
+        private bool TryValidateTriangulatedMarker(
+            int markerId,
+            (double X, double Y, double Z) position,
+            out string rejectionReason)
+        {
+            rejectionReason = "";
+            if (double.IsNaN(position.X) || double.IsNaN(position.Y) || double.IsNaN(position.Z) ||
+                double.IsInfinity(position.X) || double.IsInfinity(position.Y) || double.IsInfinity(position.Z))
+            {
+                rejectionReason = "координаты NaN/Infinity";
+                return false;
+            }
+
+            if (Math.Abs(position.X) > MaxReasonableCoordinateAbsMm ||
+                Math.Abs(position.Y) > MaxReasonableCoordinateAbsMm ||
+                Math.Abs(position.Z) > MaxReasonableCoordinateAbsMm)
+            {
+                rejectionReason = "координаты вне разумного диапазона";
+                return false;
+            }
+
+            if (position.Z < MinDepthMm || position.Z > MaxDepthMm)
+            {
+                rejectionReason = $"глубина вне диапазона [{MinDepthMm:F0}, {MaxDepthMm:F0}] мм";
+                return false;
+            }
+
+            if (!_lastAcceptedMarkerPositions.TryGetValue(markerId, out var previousPoint) ||
+                !_lastAcceptedMarkerFrame.TryGetValue(markerId, out var previousFrame))
+            {
+                return true;
+            }
+
+            var frameGap = _frameIndex - previousFrame;
+            if (frameGap > MaxFramesForJumpCheck)
+                return true;
+
+            var dx = position.X - previousPoint.X;
+            var dy = position.Y - previousPoint.Y;
+            var dz = position.Z - previousPoint.Z;
+            var jump = Math.Sqrt(dx * dx + dy * dy + dz * dz);
+            if (jump > MaxMarkerJumpMm)
+            {
+                rejectionReason = $"скачок {jump:F1} мм > {MaxMarkerJumpMm:F1} мм";
+                return false;
+            }
+
+            return true;
+        }
+
+        private void PruneHistory()
+        {
+            if (_lastAcceptedMarkerFrame.Count == 0)
+                return;
+
+            var staleMarkerIds = _lastAcceptedMarkerFrame
+                .Where(item => _frameIndex - item.Value > 120)
+                .Select(item => item.Key)
+                .ToArray();
+
+            foreach (var markerId in staleMarkerIds)
+            {
+                _lastAcceptedMarkerFrame.Remove(markerId);
+                _lastAcceptedMarkerPositions.Remove(markerId);
             }
         }
         

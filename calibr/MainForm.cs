@@ -83,7 +83,7 @@ namespace StereoCalibration
         private const int LayoutGap = 10;
         private const int TopControlsHeight = 35;
         private const int CameraLabelHeight = 22;
-        private const int ScenePreviewHeight = 90;
+        private const int ScenePreviewHeight = 150;
         private const int MarkerInfoPanelWidth = 300;
 
         public bool StartupCancelled { get; private set; }

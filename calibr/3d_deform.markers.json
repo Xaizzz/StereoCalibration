@@ -1,0 +1,15 @@
+{
+  "units": "meters",
+  "modelToCameraMarkerIds": {
+    "marker1": null,
+    "marker1.001": null,
+    "marker1.002": null,
+    "marker1.003": null,
+    "marker1.004": null,
+    "marker1.005": null,
+    "marker1.006": null,
+    "marker1.007": null,
+    "marker1.008": null,
+    "marker1.009": null
+  }
+}
