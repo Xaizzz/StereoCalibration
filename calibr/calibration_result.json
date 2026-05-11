@@ -103,5 +103,12 @@
       0.9999999999999999
     ]
   ],
-  "Error": 0.2699754743066322
+  "Error": 0.2699754743066322,
+  "MeanReprojectionErrorMonoCamera1Px": 0.19878944807999133,
+  "MeanReprojectionErrorMonoCamera2Px": 0.2851651450903028,
+  "BaselineNormMm": 103.72856273207009,
+  "StdDevMonoReprojectionRmsePerPairCamera1Px": 0.04635340787435149,
+  "StdDevMonoReprojectionRmsePerPairCamera2Px": 0.06498517895374797,
+  "ImagePairsCount": 11,
+  "CalibrationDate": "2026-05-11T12:14:45.5392604Z"
 }

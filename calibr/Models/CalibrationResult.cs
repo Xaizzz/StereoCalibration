@@ -55,10 +55,36 @@ namespace StereoCalibration.Models
         public double[,] F { get; set; }
 
         /// <summary>
-        /// Среднеквадратичная ошибка калибровки
-        /// Показатель качества калибровки (чем меньше, тем лучше)
+        /// Средне-квадратичная переотображенческая ошибка стереокалибровки OpenCV
+        /// <c>StereoCalibrate</c> (после монокалибровки, флаг FixIntrinsic). Величина в пикселях.
         /// </summary>
         public double Error { get; set; }
+
+        /// <summary>
+        /// RMS ошибка переотображения монокалибровки камеры 1 (<c>Cv2.CalibrateCamera</c>), пиксели.
+        /// </summary>
+        public double MeanReprojectionErrorMonoCamera1Px { get; set; }
+
+        /// <summary>
+        /// RMS переотображения монокалибровки камеры 2 (<c>Cv2.CalibrateCamera</c>), пиксели.
+        /// </summary>
+        public double MeanReprojectionErrorMonoCamera2Px { get; set; }
+
+        /// <summary>
+        /// Длина базовой линии (норма вектора трансляции T) между камерами; при калибровке в миллиметрах — миллиметры.
+        /// </summary>
+        public double BaselineNormMm { get; set; }
+
+        /// <summary>
+        /// Выборочное стандартное отклонение по парам кадров: для каждой пары считается
+        /// отдельный RMS по наблюдаемым–спроектированным углам, затем <c>s</c> по этому набору (камера 1).
+        /// </summary>
+        public double StdDevMonoReprojectionRmsePerPairCamera1Px { get; set; }
+
+        /// <summary>
+        /// То же, что <see cref="StdDevMonoReprojectionRmsePerPairCamera1Px"/>, для камеры 2.
+        /// </summary>
+        public double StdDevMonoReprojectionRmsePerPairCamera2Px { get; set; }
 
         /// <summary>
         /// Количество использованных пар изображений для калибровки

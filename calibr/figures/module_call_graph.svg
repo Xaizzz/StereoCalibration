@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="420" viewBox="0 0 920 420">
+  <title>StereoCalibration: controllers and services</title>
+  <desc>Minimal call graph: live video, stereo calibration, 3D scene, WPF viewport.</desc>
+  <style>
+    text { font-family: "Segoe UI", system-ui, sans-serif; fill: #111; }
+    .box { fill: #fff; stroke: #222; stroke-width: 1.2; rx: 3; ry: 3; }
+    .zone { fill: none; stroke: #888; stroke-width: 1; stroke-dasharray: 6 4; rx: 8; ry: 8; }
+    .cap { font-size: 11px; fill: #555; letter-spacing: 0.04em; }
+    .lbl { font-size: 12px; }
+    .sml { font-size: 10px; fill: #333; }
+    .arr { stroke: #222; stroke-width: 1; fill: none; marker-end: url(#mh); }
+    .arr-d { stroke: #666; stroke-width: 1; fill: none; stroke-dasharray: 5 5; marker-end: url(#mh); }
+  </style>
+  <defs>
+    <marker id="mh" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+      <polygon points="0 0, 7 3.5, 0 7" fill="#222"/>
+    </marker>
+  </defs>
+
+  <text class="cap" x="24" y="28">Video pipeline and 3D preparation</text>
+  <rect class="zone" x="16" y="36" width="560" height="170"/>
+
+  <rect class="box" x="32" y="68" width="100" height="36"/>
+  <text class="lbl" x="82" y="91" text-anchor="middle">MainForm</text>
+
+  <rect class="box" x="164" y="60" width="168" height="52"/>
+  <text class="lbl" x="248" y="85" text-anchor="middle">MainFormController</text>
+  <text class="sml" x="248" y="100" text-anchor="middle">app logic</text>
+
+  <rect class="box" x="360" y="56" width="144" height="30"/>
+  <text class="lbl" x="432" y="76" text-anchor="middle">StereoCameraService</text>
+
+  <rect class="box" x="528" y="56" width="152" height="30"/>
+  <text class="lbl" x="604" y="76" text-anchor="middle">StereoCalibrationService</text>
+
+  <rect class="box" x="376" y="104" width="144" height="30"/>
+  <text class="lbl" x="448" y="124" text-anchor="middle">ImageProcessingService</text>
+
+  <rect class="box" x="396" y="156" width="130" height="36"/>
+  <text class="lbl" x="461" y="180" text-anchor="middle">Scene3DController</text>
+
+  <rect class="box" x="552" y="156" width="112" height="36"/>
+  <text class="lbl" x="608" y="180" text-anchor="middle">Scene3DService</text>
+
+  <path class="arr" d="M 132 86 L 162 86"/>
+  <path class="arr" d="M 332 76 L 358 71"/>
+  <path class="arr" d="M 332 86 L 524 71"/>
+  <path class="arr" d="M 248 112 L 448 104"/>
+  <path class="arr" d="M 448 134 L 461 156"/>
+  <path class="arr" d="M 526 174 L 550 174"/>
+
+  <text class="sml" x="334" y="68">frames, ArUco</text>
+  <text class="sml" x="334" y="105">stereo</text>
+  <text class="sml" x="334" y="118">triangulation</text>
+
+  <text class="cap" x="24" y="238">WPF viewport and related services</text>
+  <rect class="zone" x="16" y="246" width="888" height="158"/>
+
+  <rect class="box" x="40" y="278" width="132" height="44"/>
+  <text class="lbl" x="106" y="298" text-anchor="middle">Scene3DUserControl</text>
+  <text class="sml" x="106" y="313" text-anchor="middle">Helix + UI</text>
+
+  <rect class="box" x="220" y="268" width="148" height="36"/>
+  <text class="lbl" x="294" y="290" text-anchor="middle">WoundModelService</text>
+
+  <rect class="box" x="394" y="268" width="168" height="36"/>
+  <text class="lbl" x="478" y="290" text-anchor="middle">SurfaceProjectionService</text>
+
+  <rect class="box" x="586" y="268" width="186" height="36"/>
+  <text class="lbl" x="679" y="290" text-anchor="middle">WoundMeshProjectionService</text>
+
+  <rect class="box" x="220" y="328" width="132" height="30"/>
+  <text class="lbl" x="286" y="348" text-anchor="middle">GCodeParserService</text>
+
+  <rect class="box" x="372" y="328" width="158" height="30"/>
+  <text class="lbl" x="451" y="348" text-anchor="middle">PrintTrajectoryService</text>
+
+  <path class="arr" d="M 174 287 L 216 287"/>
+  <path class="arr" d="M 370 287 L 390 287"/>
+  <path class="arr" d="M 564 287 L 582 287"/>
+  <path class="arr" d="M 286 328 L 286 306"/>
+  <path class="arr" d="M 356 346 L 368 346"/>
+
+  <path class="arr-d" d="M 608 192 L 608 240 L 106 278"/>
+  <text class="cap" x="618" y="228">Scene3DService data to viewport</text>
+  <text class="cap" x="618" y="242">(via MainForm / ElementHost)</text>
+
+  <text class="sml" x="40" y="404">Not shown: CameraManager; WoundDiagnosticsSessionRecorder; inside WoundModelService: RbfDeformationService, WoundModelLoaderService.</text>
+</svg>

@@ -5,6 +5,7 @@ using System.Linq;
 using OpenCvSharp;
 using OpenCvSharp.Aruco;
 using System.Windows.Media.Media3D;
+using StereoCalibration.Models;
 
 namespace StereoCalibration.Services
 {
@@ -33,6 +34,9 @@ namespace StereoCalibration.Services
         private readonly Dictionary<int, int> _lastAcceptedMarkerFrame = new Dictionary<int, int>();
         private int _frameIndex;
 
+        /// <summary>Сбор телеметрии стереотрекинга (JSONL-хост назначает в UI).</summary>
+        public IStereoTrackingDiagSink? StereoTrackingDiag { get; set; }
+
         private const double MinDepthMm = 30.0;
         private const double MaxDepthMm = 5000.0;
         private const double MaxMarkerJumpMm = 220.0;
@@ -57,7 +61,7 @@ namespace StereoCalibration.Services
         public void TriangulateArucoMarkers(Mat frame1, Mat frame2, 
             Point2f[][]? cornersAruco1, Point2f[][]? cornersAruco2,
             int[]? idsAruco1, int[]? idsAruco2,
-            Services.CalibrationResult calibrationResult,
+            CalibrationResult calibrationResult,
             IReadOnlyCollection<int>? staleIdsCamera1 = null,
             IReadOnlyCollection<int>? staleIdsCamera2 = null)
         {
@@ -65,11 +69,38 @@ namespace StereoCalibration.Services
                 return;
 
             _frameIndex++;
+            var utc = DateTime.UtcNow;
+            var staleIds1 = staleIdsCamera1 == null ? new HashSet<int>() : new HashSet<int>(staleIdsCamera1);
+            var staleIds2 = staleIdsCamera2 == null ? new HashSet<int>() : new HashSet<int>(staleIdsCamera2);
+            EstimateIdOverlap(idsAruco1, idsAruco2, out var uniqCam1, out var uniqCam2, out var bilateralOverlap, out var unpairedSlots);
+            void NotifyTracking(StereoTrackingFrameObservation o) =>
+                StereoTrackingDiag?.NotifyFrame(o);
 
             if (cornersAruco1 == null || cornersAruco2 == null ||
                 idsAruco1 == null || idsAruco2 == null || idsAruco1.Length == 0 || idsAruco2.Length == 0)
             {
                 OnMarkerPositions3DUpdated?.Invoke(new Dictionary<int, (double X, double Y, double Z)>());
+                NotifyTracking(new StereoTrackingFrameObservation
+                {
+                    StereoFrameSeq = _frameIndex,
+                    TimestampUtc = utc,
+                    HadRawDetections = (idsAruco1?.Length > 0) || (idsAruco2?.Length > 0),
+                    UniqueIdsCam1 = uniqCam1,
+                    UniqueIdsCam2 = uniqCam2,
+                    BilateralOverlapCount = bilateralOverlap,
+                    UnpairedMarkerIdSlots = unpairedSlots,
+                    StereoPairsRejectedStale = 0,
+                    StereoPairsEligibleForTriangulation = 0,
+                    StaleMarkersReportedCam1 = staleIds1.Count,
+                    StaleMarkersReportedCam2 = staleIds2.Count,
+                    TriangulationAcceptedCount = 0,
+                    ValidationRejectCoordinates = 0,
+                    ValidationRejectDepth = 0,
+                    ValidationRejectJump = 0,
+                    AcceptedMarkerIds = null,
+                    AcceptedZMm = null,
+                    TriangulationSolveFailuresApprox = 0
+                });
                 return;
             }
             
@@ -77,14 +108,12 @@ namespace StereoCalibration.Services
             {
                 Debug.WriteLine($"=== НАЧАЛО ТРИАНГУЛЯЦИИ ===");
                 Debug.WriteLine($"Найдено маркеров: камера 1 - {idsAruco1.Length}, камера 2 - {idsAruco2.Length}");
-                var staleIds1 = staleIdsCamera1 == null
-                    ? new HashSet<int>()
-                    : new HashSet<int>(staleIdsCamera1);
-                var staleIds2 = staleIdsCamera2 == null
-                    ? new HashSet<int>()
-                    : new HashSet<int>(staleIdsCamera2);
+
                 var rejectedByStale = 0;
-                var rejectedByValidation = 0;
+                var rejCoord = 0;
+                var rejDepth = 0;
+                var rejJump = 0;
+                var triSolveFails = 0;
 
                 // Сопоставление маркеров по ID. Триангуляция возможна только для
                 // одного и того же физического маркера, найденного в обеих камерах.
@@ -132,10 +161,22 @@ namespace StereoCalibration.Services
                         cameraMatrix1Mat, cameraMatrix2Mat, distCoeffs1Mat, distCoeffs2Mat,
                         calibrationResult, frame1, frame2, out var position))
                     {
-                        if (!TryValidateTriangulatedMarker(marker.Key, position, out var rejectionReason))
+                        if (!TryValidateTriangulatedMarker(marker.Key, position, out var failKind))
                         {
-                            rejectedByValidation++;
-                            Debug.WriteLine($"Маркер ID {marker.Key} отброшен после триангуляции: {rejectionReason}");
+                            switch (failKind)
+                            {
+                                case TriangulationValidationFailureKind.BadCoordinatesSanity:
+                                    rejCoord++;
+                                    break;
+                                case TriangulationValidationFailureKind.DepthRange:
+                                    rejDepth++;
+                                    break;
+                                case TriangulationValidationFailureKind.TemporalJump:
+                                    rejJump++;
+                                    break;
+                            }
+
+                            Debug.WriteLine($"Маркер ID {marker.Key} отброшен после триангуляции: {DescribeValidationFailure(failKind)}");
                             continue;
                         }
 
@@ -143,15 +184,43 @@ namespace StereoCalibration.Services
                         _lastAcceptedMarkerPositions[marker.Key] = new Point3D(position.X, position.Y, position.Z);
                         _lastAcceptedMarkerFrame[marker.Key] = _frameIndex;
                     }
+                    else
+                    {
+                        triSolveFails++;
+                    }
                 }
 
                 OnMarkerPositions3DUpdated?.Invoke(triangulatedMarkers);
                 PruneHistory();
                 Debug.WriteLine(
-                    $"Фильтр триангуляции: stale={rejectedByStale}, invalid={rejectedByValidation}, accepted={triangulatedMarkers.Count}");
+                    $"Фильтр триангуляции: stale={rejectedByStale}, invalid.coord={rejCoord}, invalid.depth={rejDepth}, invalid.jump={rejJump}, accepted={triangulatedMarkers.Count}");
                 
                 Debug.WriteLine($"=== КОНЕЦ ТРИАНГУЛЯЦИИ ===");
-                
+
+                NotifyTracking(new StereoTrackingFrameObservation
+                {
+                    StereoFrameSeq = _frameIndex,
+                    TimestampUtc = utc,
+                    HadRawDetections = true,
+                    UniqueIdsCam1 = uniqCam1,
+                    UniqueIdsCam2 = uniqCam2,
+                    BilateralOverlapCount = bilateralOverlap,
+                    UnpairedMarkerIdSlots = unpairedSlots,
+                    StereoPairsRejectedStale = rejectedByStale,
+                    StereoPairsEligibleForTriangulation = matchedMarkers.Count,
+                    StaleMarkersReportedCam1 = staleIds1.Count,
+                    StaleMarkersReportedCam2 = staleIds2.Count,
+                    TriangulationAcceptedCount = triangulatedMarkers.Count,
+                    ValidationRejectCoordinates = rejCoord,
+                    ValidationRejectDepth = rejDepth,
+                    ValidationRejectJump = rejJump,
+                    AcceptedMarkerIds = triangulatedMarkers.Count > 0 ? triangulatedMarkers.Keys.OrderBy(static x => x).ToArray() : null,
+                    AcceptedZMm = triangulatedMarkers.Count > 0
+                        ? triangulatedMarkers.Values.Select(static p => p.Z).ToArray()
+                        : null,
+                    TriangulationSolveFailuresApprox = triSolveFails
+                });
+
                 // Освобождение ресурсов
                 cameraMatrix1Mat.Dispose();
                 cameraMatrix2Mat.Dispose();
@@ -167,16 +236,61 @@ namespace StereoCalibration.Services
             }
         }
 
+        private static void EstimateIdOverlap(int[]? ids1, int[]? ids2, out int uniq1, out int uniq2,
+            out int bilateralOverlapCount, out int unpairedSlots)
+        {
+            uniq1 = uniq2 = bilateralOverlapCount = unpairedSlots = 0;
+            if (ids1 == null || ids2 == null || ids1.Length == 0 || ids2.Length == 0)
+                return;
+
+            var s1 = new HashSet<int>();
+            foreach (var id in ids1)
+                s1.Add(id);
+            var s2 = new HashSet<int>();
+            foreach (var id in ids2)
+                s2.Add(id);
+
+            uniq1 = s1.Count;
+            uniq2 = s2.Count;
+            bilateralOverlapCount = s1.Count(id => s2.Contains(id));
+
+            var only1 = 0;
+            foreach (var id in s1)
+            {
+                if (!s2.Contains(id))
+                    only1++;
+            }
+
+            var only2 = 0;
+            foreach (var id in s2)
+            {
+                if (!s1.Contains(id))
+                    only2++;
+            }
+
+            unpairedSlots = only1 + only2;
+        }
+
+        private static string DescribeValidationFailure(TriangulationValidationFailureKind kind) =>
+            kind switch
+            {
+                TriangulationValidationFailureKind.BadCoordinatesSanity => "NaN / бесконечность или вне допустимых координат",
+                TriangulationValidationFailureKind.DepthRange => "глубина вне полосы фильтра",
+                TriangulationValidationFailureKind.TemporalJump => $"скачок 3D > {MaxMarkerJumpMm:F0} мм",
+                _ => "не определено"
+            };
+
         private bool TryValidateTriangulatedMarker(
             int markerId,
             (double X, double Y, double Z) position,
-            out string rejectionReason)
+            out TriangulationValidationFailureKind failureKind)
         {
-            rejectionReason = "";
+            failureKind = TriangulationValidationFailureKind.None;
+
             if (double.IsNaN(position.X) || double.IsNaN(position.Y) || double.IsNaN(position.Z) ||
                 double.IsInfinity(position.X) || double.IsInfinity(position.Y) || double.IsInfinity(position.Z))
             {
-                rejectionReason = "координаты NaN/Infinity";
+                failureKind = TriangulationValidationFailureKind.BadCoordinatesSanity;
                 return false;
             }
 
@@ -184,21 +298,19 @@ namespace StereoCalibration.Services
                 Math.Abs(position.Y) > MaxReasonableCoordinateAbsMm ||
                 Math.Abs(position.Z) > MaxReasonableCoordinateAbsMm)
             {
-                rejectionReason = "координаты вне разумного диапазона";
+                failureKind = TriangulationValidationFailureKind.BadCoordinatesSanity;
                 return false;
             }
 
             if (position.Z < MinDepthMm || position.Z > MaxDepthMm)
             {
-                rejectionReason = $"глубина вне диапазона [{MinDepthMm:F0}, {MaxDepthMm:F0}] мм";
+                failureKind = TriangulationValidationFailureKind.DepthRange;
                 return false;
             }
 
             if (!_lastAcceptedMarkerPositions.TryGetValue(markerId, out var previousPoint) ||
                 !_lastAcceptedMarkerFrame.TryGetValue(markerId, out var previousFrame))
-            {
                 return true;
-            }
 
             var frameGap = _frameIndex - previousFrame;
             if (frameGap > MaxFramesForJumpCheck)
@@ -210,7 +322,7 @@ namespace StereoCalibration.Services
             var jump = Math.Sqrt(dx * dx + dy * dy + dz * dz);
             if (jump > MaxMarkerJumpMm)
             {
-                rejectionReason = $"скачок {jump:F1} мм > {MaxMarkerJumpMm:F1} мм";
+                failureKind = TriangulationValidationFailureKind.TemporalJump;
                 return false;
             }
 
@@ -245,7 +357,7 @@ namespace StereoCalibration.Services
         /// </summary>
         private bool TriangulateMarker(int markerId, Point2f[] leftCorners, Point2f[] rightCorners,
             Mat cameraMatrix1, Mat cameraMatrix2, Mat distCoeffs1, Mat distCoeffs2,
-            Services.CalibrationResult calibrationResult, Mat frame1, Mat frame2,
+            CalibrationResult calibrationResult, Mat frame1, Mat frame2,
             out (double X, double Y, double Z) position)
         {
             position = default;

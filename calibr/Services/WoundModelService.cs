@@ -53,6 +53,15 @@ namespace StereoCalibration.Services
         private const double InnerMarkerNonRigidBoost = 0.5;
         private const double CenterVertexNormalStiffnessMin = 0.045;
         private const double WoundNormalStiffnessPower = 2.15;
+        /// <summary>Ниже этого нормализованного радиуса от центра кольца включается сгущение ограничения «выпирания» по нормали.</summary>
+        private const double CavityCoreOutwardBlendRadialEnd = 0.52;
+        private const double CavityCoreOutwardBlendRadialStart = 0.22;
+        /// <summary>Жёсткий потолок на положительную (к «наружней» стороне относительно эталонной нормали) составляющую остатка в ядре полости.</summary>
+        private const double CavityCoreMaxOutwardNormalResidualMm = 3.8;
+        /// <summary>Вершины ближе к оси центра кольца маркеров (нормализованный радиус) считаются «ядром раны» и к жёсткому каркасу почти без остатка.</summary>
+        private const double WoundCenterPinCoreNormalizedRadius = 0.042;
+        /// <summary>Вне этого радиуса закрепление центра полностью снято — деформируются края как раньше.</summary>
+        private const double WoundCenterPinFadeOutNormalizedRadius = 0.14;
         private const double MarkerBiasCompensation = 0.25;
         private const double MinRigidScaleCandidate = 0.60;
         private const double MaxRigidScaleCandidate = 1.40;
@@ -796,6 +805,9 @@ namespace StereoCalibration.Services
             _referenceMarkerBiasRmseMm = _referenceMarkerBiasVectors.Length == 0
                 ? 0
                 : Math.Sqrt(_referenceMarkerBiasVectors.Average(vector => vector.Length * vector.Length));
+            var captureResidualMaxMm = _referenceMarkerBiasVectors.Length == 0
+                ? 0
+                : _referenceMarkerBiasVectors.Max(vector => vector.Length);
             _referenceMarkerCentroidAligned = CalculateCentroid(_referenceControlPointsAligned);
             _referenceMarkerMaxRadiusMm = Math.Max(
                 MinMarkerRadiusForProfileMm,
@@ -869,6 +881,7 @@ namespace StereoCalibration.Services
                 },
                 alignmentRmseMm = LastAlignmentRmseMm,
                 referenceBiasRmseMm = _referenceMarkerBiasRmseMm,
+                referenceResidualMaxMm = captureResidualMaxMm,
                 alignedVertexCount = alignedVertices.Length,
                 estimatedSurfaceNormalCamera1 = new
                 {
@@ -1692,7 +1705,18 @@ namespace StereoCalibration.Services
                 var maxTangent = maxResidual;
                 var normalCoord = Vector3D.DotProduct(residual, n);
                 var tangential = residual - n * normalCoord;
-                var clampedNormal = Clamp(normalCoord, -maxNormal, maxNormal);
+                var radialSpan =
+                    Math.Max(1e-6, CavityCoreOutwardBlendRadialEnd - CavityCoreOutwardBlendRadialStart);
+                var cavityCoreBlend = Clamp(
+                    (CavityCoreOutwardBlendRadialEnd - normalizedRadius) / radialSpan,
+                    0.0,
+                    1.0);
+                var outwardCap = Math.Min(
+                    maxNormal,
+                    CavityCoreMaxOutwardNormalResidualMm *
+                    Math.Max(0.35, centerToEdgeFactor));
+                var maxPositiveAlongNormal = maxNormal - cavityCoreBlend * (maxNormal - outwardCap);
+                var clampedNormal = Clamp(normalCoord, -maxNormal, maxPositiveAlongNormal);
                 var tangentialClamped = ClampVectorLength(tangential, maxTangent);
                 var constrainedResidual = tangentialClamped + n * clampedNormal;
 
@@ -1706,10 +1730,32 @@ namespace StereoCalibration.Services
                     constrainedResidual = previousResidual + (updatedResidual - previousResidual) * ResidualTemporalBlend;
                 }
 
+                var centerPinWeight = WoundCenterPinWeight(normalizedRadius);
+                if (centerPinWeight > 0)
+                    constrainedResidual *= 1.0 - centerPinWeight;
+
                 result[i] = rigidPoint + constrainedResidual;
             }
 
             return result;
+        }
+
+        /// <summary>
+        /// Возвращает 1 у самого центра кольца маркеров (относительно жёсткого каркаса), плавно до 0 к краям зоны закрепления.
+        /// </summary>
+        private static double WoundCenterPinWeight(double normalizedRadiusFromMarkerCentroid)
+        {
+            var span =
+                Math.Max(
+                    1e-6,
+                    WoundCenterPinFadeOutNormalizedRadius - WoundCenterPinCoreNormalizedRadius);
+            if (normalizedRadiusFromMarkerCentroid >= WoundCenterPinFadeOutNormalizedRadius)
+                return 0.0;
+            if (normalizedRadiusFromMarkerCentroid <= WoundCenterPinCoreNormalizedRadius)
+                return 1.0;
+            var t =
+                (WoundCenterPinFadeOutNormalizedRadius - normalizedRadiusFromMarkerCentroid) / span;
+            return Clamp(t, 0.0, 1.0);
         }
 
         private void FreezeMesh(WoundPoseState poseState)

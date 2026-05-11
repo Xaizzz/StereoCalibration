@@ -70,19 +70,23 @@ namespace StereoCalibration.Services
 
                     Debug.WriteLine($"Калибровка завершена. Ошибка: {error}");
 
+                    var translationSnapshot = MatToVector(T);
+
                     // Создание результата
-                    var result = new StereoCalibration.Models.CalibrationResult
+                    var result = new CalibrationResult
                     {
                         CameraMatrix1 = MatToArray(cameraMatrix1),
                         DistCoeffs1 = MatToVector(distCoeffs1),
                         CameraMatrix2 = MatToArray(cameraMatrix2),
                         DistCoeffs2 = MatToVector(distCoeffs2),
                         R = MatToArray(R),
-                        T = MatToVector(T),
+                        T = translationSnapshot,
                         E = MatToArray(E),
                         F = MatToArray(F),
                         Error = error,
-                                                 // Можно добавить дополнительные поля при необходимости
+                        ImagePairsCount = objectPoints.Count,
+                        CalibrationDate = DateTime.UtcNow,
+                        BaselineNormMm = TranslationNormMm(translationSnapshot),
                     };
 
                     // Освобождение ресурсов
@@ -290,6 +294,17 @@ namespace StereoCalibration.Services
         public int GetRecommendedImageCount()
         {
             return 15; // Рекомендуется не менее 15 пар изображений
+        }
+
+        /// <remarks>Живёт здесь локально — полный пайплайн как в StereoCalibrationService не воспроизводится.</remarks>
+        private static double TranslationNormMm(double[]? tMm)
+        {
+            if (tMm == null || tMm.Length < 3)
+                return 0;
+            var vx = tMm[0];
+            var vy = tMm[1];
+            var vz = tMm[2];
+            return Math.Sqrt(vx * vx + vy * vy + vz * vz);
         }
     }
 } 

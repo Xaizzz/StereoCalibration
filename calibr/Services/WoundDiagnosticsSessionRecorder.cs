@@ -7,6 +7,7 @@ using System.Linq;
 using System.Threading;
 using System.Windows.Media.Media3D;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 
 namespace StereoCalibration.Services
 {
@@ -55,7 +56,12 @@ namespace StereoCalibration.Services
                 };
 
                 var line = JsonConvert.SerializeObject(envelope, SerializerSettings) + Environment.NewLine;
-                AppendLineInternal(line);
+                lock (_fileLock)
+                {
+                    AppendMainTraceLineUnlocked(line);
+                    if (string.Equals(eventType, "capture_reference", StringComparison.OrdinalIgnoreCase))
+                        AppendReferenceCaptureMetricsFileUnlocked(payload);
+                }
 
                 Trace.WriteLine("[WoundDiag] " + eventType);
             }
@@ -141,40 +147,67 @@ namespace StereoCalibration.Services
             return Math.Sqrt(dx * dx + dy * dy + dz * dz);
         }
 
-        private void AppendLineInternal(string line)
+        /// <remarks>Вызывать только под <see cref="_fileLock"/>.</remarks>
+        private void AppendMainTraceLineUnlocked(string line)
         {
             var baseDir = AppDomain.CurrentDomain.BaseDirectory;
             var path = _resolvedPath ?? Path.Combine(baseDir, "wound_deformation_live_trace.jsonl");
             Directory.CreateDirectory(Path.GetDirectoryName(path) ?? baseDir);
 
-            lock (_fileLock)
+            if (!_sessionBannerWritten)
             {
-                if (!_sessionBannerWritten)
+                var bannerObj = new
                 {
-                    var bannerObj = new
+                    t = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture),
+                    seq = 0L,
+                    pid = Environment.ProcessId,
+                    evt = "session_start",
+                    d = new
                     {
-                        t = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture),
-                        seq = 0L,
-                        pid = Environment.ProcessId,
-                        evt = "session_start",
-                        d = new
-                        {
-                            file = Path.GetFileName(path),
-                            fullPath = path,
-                            machine = Environment.MachineName,
-                            dotnet = Environment.Version.ToString(),
-                            product = nameof(StereoCalibration)
-                        }
-                    };
-                    File.AppendAllText(
-                        path,
-                        JsonConvert.SerializeObject(bannerObj, SerializerSettings) + Environment.NewLine);
-                    _resolvedPath ??= path;
-                    _sessionBannerWritten = true;
-                }
-
-                File.AppendAllText(_resolvedPath!, line);
+                        file = Path.GetFileName(path),
+                        fullPath = path,
+                        companionMetricsPath = Path.Combine(baseDir, "reference_capture_metrics.jsonl"),
+                        machine = Environment.MachineName,
+                        dotnet = Environment.Version.ToString(),
+                        product = nameof(StereoCalibration)
+                    }
+                };
+                File.AppendAllText(
+                    path,
+                    JsonConvert.SerializeObject(bannerObj, SerializerSettings) + Environment.NewLine);
+                _resolvedPath ??= path;
+                _sessionBannerWritten = true;
             }
+
+            File.AppendAllText(_resolvedPath!, line);
+        }
+
+        /// <summary>
+        /// Ключевые метрики каждого CaptureReference без полного дампа события
+        /// (удобно для отчётов и серий испытаний).
+        /// </summary>
+        /// <remarks>Вызывать только под <see cref="_fileLock"/>.</remarks>
+        private void AppendReferenceCaptureMetricsFileUnlocked(object? payload)
+        {
+            if (payload == null)
+                return;
+
+            var jo = JObject.FromObject(payload);
+            var slim = new JObject
+            {
+                ["t"] = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture),
+                ["evt"] = "reference_capture_metrics",
+                ["pid"] = Environment.ProcessId,
+                ["alignmentRmseMm"] = jo["alignmentRmseMm"],
+                ["referenceBiasRmseMm"] = jo["referenceBiasRmseMm"],
+                ["referenceResidualMaxMm"] = jo["referenceResidualMaxMm"],
+                ["activeMarkerIds"] = jo["activeMarkerIds"]
+            };
+
+            var baseDir = AppDomain.CurrentDomain.BaseDirectory;
+            var path = Path.Combine(baseDir, "reference_capture_metrics.jsonl");
+            Directory.CreateDirectory(Path.GetDirectoryName(path) ?? baseDir);
+            File.AppendAllText(path, JsonConvert.SerializeObject(slim, SerializerSettings) + Environment.NewLine);
         }
     }
 }

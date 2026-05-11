@@ -3,6 +3,7 @@ using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Windows.Forms;
+using StereoCalibration.Models;
 using StereoCalibration.Services;
 using OpenCvSharp.Aruco;
 using OpenCvSharp.Extensions;
@@ -50,7 +51,7 @@ namespace StereoCalibration.Controllers
         private bool _isRunning = false;
         private Mat _frame1 = new Mat();
         private Mat _frame2 = new Mat();
-        private Services.CalibrationResult? _calibrationResult;
+        private CalibrationResult? _calibrationResult;
         private List<Point3f> _ps3dAllOut = new List<Point3f>();
         #endregion
 
@@ -78,6 +79,7 @@ namespace StereoCalibration.Controllers
             _calibrationService = new StereoCalibrationService(_patternSize, _squareSize);
             _imageProcessingService = new ImageProcessingService();
             _scene3DController = new Scene3DController();
+            _imageProcessingService.StereoTrackingDiag = StereoTrackingSessionRecorder.Instance;
 
             // Инициализация ArUco детектора
             _dictionary = ArucoDetectionProfile.CreateDictionary();
@@ -136,6 +138,7 @@ namespace StereoCalibration.Controllers
             {
                 if (!_isRunning)
                 {
+                    StereoTrackingSessionRecorder.Instance.BeginSession();
                     _isRunning = true;
                     _stereoCameraService.StartCapture();
                 }
@@ -143,6 +146,7 @@ namespace StereoCalibration.Controllers
                 {
                     _isRunning = false;
                     _stereoCameraService.StopCapture();
+                    StereoTrackingSessionRecorder.Instance.EndSession();
                 }
                 OnRunningStateChanged?.Invoke(_isRunning);
             }

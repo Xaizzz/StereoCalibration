@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using StereoCalibration.Models;
 using OpenCvSharp;
 using OpenCvSharp.Aruco;
 using Newtonsoft.Json;
@@ -292,9 +293,14 @@ namespace StereoCalibration.Services
                 };
 
                 // Дополнительная диагностика
-                Debug.WriteLine($"Стереокалибровка завершена. Ошибка: {error:F6}");
-                Debug.WriteLine($"Расстояние между камерами: {Math.Sqrt(result.T[0]*result.T[0] + result.T[1]*result.T[1] + result.T[2]*result.T[2]):F2} мм");
-                
+                FillCalibrationDiagnostics(ps3dAll, ps2dAll1, ps2dAll2, err1, err2,
+                    cameraMatrix1, distCoeffs1, cameraMatrix2, distCoeffs2,
+                    rvecs1, tvecs1, rvecs2, tvecs2,
+                    result);
+
+                Debug.WriteLine($"Стереокалибровка завершена. Stereo RMS (px): {error:F6}; mono RMS: {result.MeanReprojectionErrorMonoCamera1Px:F4}, {result.MeanReprojectionErrorMonoCamera2Px:F4}; baseline: {result.BaselineNormMm:F2} мм");
+                Debug.WriteLine($"Sigma per-pair mono RMS — cam1 {result.StdDevMonoReprojectionRmsePerPairCamera1Px:F4}, cam2 {result.StdDevMonoReprojectionRmsePerPairCamera2Px:F4} px (n={result.ImagePairsCount} пар)");
+
                 return result;
             }
             catch (OpenCvSharp.OpenCVException ex)
@@ -302,6 +308,193 @@ namespace StereoCalibration.Services
                 Debug.WriteLine($"Ошибка стереокалибровки: {ex.Message}");
                 throw;
             }
+        }
+
+        private static void FillCalibrationDiagnostics(
+            IReadOnlyList<List<Point3f>> ps3dAll,
+            IReadOnlyList<List<Point2f>> ps2dAll1,
+            IReadOnlyList<List<Point2f>> ps2dAll2,
+            double err1Px,
+            double err2Px,
+            double[,] cameraMatrix1,
+            double[] distCoeffs1,
+            double[,] cameraMatrix2,
+            double[] distCoeffs2,
+            IReadOnlyList<Vec3d> rvecs1,
+            IReadOnlyList<Vec3d> tvecs1,
+            IReadOnlyList<Vec3d> rvecs2,
+            IReadOnlyList<Vec3d> tvecs2,
+            CalibrationResult destination)
+        {
+            destination.ImagePairsCount = ps3dAll.Count;
+            destination.MeanReprojectionErrorMonoCamera1Px = err1Px;
+            destination.MeanReprojectionErrorMonoCamera2Px = err2Px;
+            destination.CalibrationDate = DateTime.UtcNow;
+            destination.BaselineNormMm = BaselineMmFromTranslation(destination.T);
+
+            var perRmseCam1 = new List<double>(ps3dAll.Count);
+            var perRmseCam2 = new List<double>(ps3dAll.Count);
+
+            using var cm1Mat = CameraMatrixToMat(cameraMatrix1);
+            using var cm2Mat = CameraMatrixToMat(cameraMatrix2);
+            using var d1Mat = DistCoeffsToMat(distCoeffs1);
+            using var d2Mat = DistCoeffsToMat(distCoeffs2);
+
+            for (var i = 0; i < ps3dAll.Count; i++)
+            {
+                perRmseCam1.Add(ComputeViewMonoRmsePx(
+                    ps3dAll[i],
+                    ps2dAll1[i],
+                    cm1Mat,
+                    d1Mat,
+                    rvecs1[i],
+                    tvecs1[i]));
+
+                perRmseCam2.Add(ComputeViewMonoRmsePx(
+                    ps3dAll[i],
+                    ps2dAll2[i],
+                    cm2Mat,
+                    d2Mat,
+                    rvecs2[i],
+                    tvecs2[i]));
+            }
+
+            destination.StdDevMonoReprojectionRmsePerPairCamera1Px = SampleStdDeviation(perRmseCam1);
+            destination.StdDevMonoReprojectionRmsePerPairCamera2Px = SampleStdDeviation(perRmseCam2);
+        }
+
+        /// <remarks>Стандартное отклонение выборки; при числе наблюдений &lt; 2 возвращает 0.</remarks>
+        private static double SampleStdDeviation(IReadOnlyCollection<double> values)
+        {
+            if (values == null || values.Count == 0)
+                return 0;
+
+            var v = values.Where(static x => !double.IsNaN(x) && !double.IsInfinity(x)).ToList();
+            if (v.Count < 2)
+                return 0;
+
+            var mean = v.Average();
+            var sumSq = v.Sum(x =>
+            {
+                var d = x - mean;
+                return d * d;
+            });
+            return Math.Sqrt(sumSq / (v.Count - 1));
+        }
+
+        private static double BaselineMmFromTranslation(double[]? tMm)
+        {
+            if (tMm == null || tMm.Length < 3)
+                return 0;
+            var vx = tMm[0];
+            var vy = tMm[1];
+            var vz = tMm[2];
+            return Math.Sqrt(vx * vx + vy * vy + vz * vz);
+        }
+
+        private static Mat CameraMatrixToMat(double[,] matrix)
+        {
+            var m = new Mat(3, 3, MatType.CV_64FC1);
+            for (var r = 0; r < 3; r++)
+            {
+                for (var c = 0; c < 3; c++)
+                    m.At<double>(r, c) = matrix[r, c];
+            }
+            return m;
+        }
+
+        private static Mat DistCoeffsToMat(double[] coeffs)
+        {
+            var n = coeffs?.Length ?? 0;
+            var m = new Mat(n <= 0 ? 1 : n, 1, MatType.CV_64FC1);
+            for (var i = 0; i < n; i++)
+                m.At<double>(i, 0) = coeffs![i];
+            return m;
+        }
+
+        private static Mat RodriguesVec3ToColumnMat(Vec3d rvec)
+        {
+            var m = new Mat(3, 1, MatType.CV_64FC1);
+            m.At<double>(0, 0) = rvec.Item0;
+            m.At<double>(1, 0) = rvec.Item1;
+            m.At<double>(2, 0) = rvec.Item2;
+            return m;
+        }
+
+        private static Mat TranslationVec3ToColumnMat(Vec3d tvec)
+        {
+            var m = new Mat(3, 1, MatType.CV_64FC1);
+            m.At<double>(0, 0) = tvec.Item0;
+            m.At<double>(1, 0) = tvec.Item1;
+            m.At<double>(2, 0) = tvec.Item2;
+            return m;
+        }
+
+        private static bool TryReadProjectedPixel(Mat projected, int rowIndex, out Point2d p)
+        {
+            p = default;
+            var t = projected.Type();
+            if (t == MatType.CV_64FC2)
+            {
+                var v = projected.At<Vec2d>(rowIndex, 0);
+                p = new Point2d(v.Item0, v.Item1);
+                return true;
+            }
+
+            if (t == MatType.CV_32FC2)
+            {
+                var v = projected.At<Vec2f>(rowIndex, 0);
+                p = new Point2d(v.Item0, v.Item1);
+                return true;
+            }
+
+            if (projected.Cols >= 2 && projected.Channels() == 1)
+            {
+                p = new Point2d(projected.At<double>(rowIndex, 0), projected.At<double>(rowIndex, 1));
+                return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Одна доска-пара: RMS по наблюдаемым и заново спроектированным пиксельным координатам.
+        /// </summary>
+        private static double ComputeViewMonoRmsePx(
+            IReadOnlyList<Point3f> objectMm,
+            IReadOnlyList<Point2f> imagePxObserved,
+            Mat cameraMatrix,
+            Mat distCoeffs,
+            Vec3d rvec,
+            Vec3d tvec)
+        {
+            using var projected = new Mat();
+            using var objectMat = Mat.FromArray(objectMm.ToArray());
+            using var rotationMat = RodriguesVec3ToColumnMat(rvec);
+            using var translationMat = TranslationVec3ToColumnMat(tvec);
+
+            Cv2.ProjectPoints(objectMat, rotationMat, translationMat, cameraMatrix, distCoeffs, projected);
+
+            var n = objectMm.Count;
+            if (imagePxObserved.Count != n || n == 0)
+                return double.NaN;
+
+            if (projected.Rows != n)
+                return double.NaN;
+
+            double sse = 0;
+            for (var j = 0; j < n; j++)
+            {
+                if (!TryReadProjectedPixel(projected, j, out var pred))
+                    return double.NaN;
+
+                var o = imagePxObserved[j];
+                var dx = pred.X - o.X;
+                var dy = pred.Y - o.Y;
+                sse += dx * dx + dy * dy;
+            }
+
+            return Math.Sqrt(sse / n);
         }
         
         /// <summary>Копирует OpenCV Mat в двумерный массив, пригодный для JSON-сериализации.</summary>
@@ -359,26 +552,5 @@ namespace StereoCalibration.Services
             var json = File.ReadAllText(filename);
             return JsonConvert.DeserializeObject<CalibrationResult>(json);
         }
-
-
-    }
-    
-    /// <summary>
-    /// DTO с результатами калибровки, сохраняемый в `calibration_result.json`.
-    /// 
-    /// Свойства намеренно представлены массивами, а не Mat: так объект легко
-    /// сериализуется Newtonsoft.Json и может быть загружен при следующем запуске.
-    /// </summary>
-    public class CalibrationResult
-    {
-        public double[,] CameraMatrix1 { get; set; } // Матрица камеры 1 (3x3)
-        public double[] DistCoeffs1 { get; set; }   // Коэффициенты искажения 1 (5)
-        public double[,] CameraMatrix2 { get; set; } // Матрица камеры 2 (3x3)
-        public double[] DistCoeffs2 { get; set; }   // Коэффициенты искажения 2 (5)
-        public double[,] R { get; set; }            // Матрица вращения (3x3)
-        public double[] T { get; set; }             // Вектор трансляции (3)
-        public double[,] E { get; set; }            // Существенная матрица (3x3)
-        public double[,] F { get; set; }            // Фундаментальная матрица (3x3)
-        public double Error { get; set; }           // Ошибка калибровки
     }
 }

@@ -2231,6 +2231,23 @@ namespace StereoCalibration.UI
                 return false;
             }
 
+            var markerZoneScene = new List<Point3D>();
+            foreach (var markerId in _woundModelService.ActiveDeformationMarkerIds)
+            {
+                if (_scene3DService.MarkerPositions.TryGetValue(markerId, out var scenePoint))
+                    markerZoneScene.Add(scenePoint);
+            }
+
+            if (markerZoneScene.Count < WoundMeshProjectionService.MinMarkersForDeformation)
+            {
+                _deformationStatus =
+                    $"В поле зрения: {markerZoneScene.Count}/{WoundMeshProjectionService.MinMarkersForDeformation}+ привязанных маркеров.";
+                UpdateTrajectoryDiagnosticsPanel();
+                SetGCodeStatus(
+                    $"Для mesh-печати по зоне маркеров нужно минимум {WoundMeshProjectionService.MinMarkersForDeformation} привязанных маркеров одновременно в кадре (сейчас {markerZoneScene.Count}).");
+                return false;
+            }
+
             if (!TryGetCurrentWoundMeshSceneSnapshot(out var meshVerticesScene, out var meshTriangles))
             {
                 SetGCodeStatus("Не удалось сформировать snapshot деформированной модели для печати.");
@@ -2243,7 +2260,8 @@ namespace StereoCalibration.UI
                 meshTriangles,
                 supportMarkerCount,
                 preferredSidePoint,
-                out var printReference))
+                out var printReference,
+                markerZoneScene))
             {
                 SetGCodeStatus("Не удалось зафиксировать референсную mesh-поверхность печати.");
                 return false;

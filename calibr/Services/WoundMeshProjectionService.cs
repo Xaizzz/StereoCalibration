@@ -26,13 +26,16 @@ namespace StereoCalibration.Services
         public const int MinMarkersForDeformation = 3;
         public const double SafetyClearanceMm = PathSurfaceLiftMm;
 
+        private const double MinimumFitBoundsSpanMm = 1e-3;
+
         public bool TryCreateReference(
             ParsedGCodePath sourcePath,
             IReadOnlyList<Point3D> referenceVertices,
             IReadOnlyList<int> triangleIndices,
             int supportMarkerCount,
             Point3D preferredSidePoint,
-            out WoundMeshPrintReference printReference)
+            out WoundMeshPrintReference printReference,
+            IReadOnlyList<Point3D>? markerZoneScenePoints = null)
         {
             printReference = null!;
             if (sourcePath == null ||
@@ -62,9 +65,34 @@ namespace StereoCalibration.Services
             if (triangles.Count == 0)
                 return false;
 
-            var surfaceBounds = GetSurfaceBounds(referencePoints2D);
-            var safeSurfaceBounds = BuildSafeSurfaceBounds(surfaceBounds);
-            var fitTransform = BuildAutoFitTransform(sourceBounds, surfaceBounds);
+            var meshSurfaceBounds = GetSurfaceBounds(referencePoints2D);
+            var markerSurfaceBounds = TryGetMarkerProjectedUvBounds(
+                markerZoneScenePoints,
+                projectionAxes.First,
+                projectionAxes.Second);
+            SurfaceBounds fitSourceBounds = meshSurfaceBounds;
+            SurfaceBounds safeSurfaceBounds;
+
+            if (markerSurfaceBounds.HasValue)
+            {
+                var projected = markerSurfaceBounds.Value;
+                var safeMarker = BuildSafeSurfaceBounds(projected);
+                if (SpansArePositive(safeMarker))
+                {
+                    fitSourceBounds = projected;
+                    safeSurfaceBounds = safeMarker;
+                }
+                else
+                {
+                    safeSurfaceBounds = BuildSafeSurfaceBounds(meshSurfaceBounds);
+                }
+            }
+            else
+            {
+                safeSurfaceBounds = BuildSafeSurfaceBounds(meshSurfaceBounds);
+            }
+
+            var fitTransform = BuildAutoFitTransform(sourceBounds, fitSourceBounds);
             var sourceMinZ = sourcePath.MinZ;
 
             var anchoredMoves = new List<MeshAnchoredPrintMove>(sourcePath.Moves.Count);
@@ -386,6 +414,31 @@ namespace StereoCalibration.Services
                 surfaceBounds.MaxU - insetU,
                 surfaceBounds.MinV + insetV,
                 surfaceBounds.MaxV - insetV);
+        }
+
+        private static SurfaceBounds? TryGetMarkerProjectedUvBounds(
+            IReadOnlyList<Point3D>? markerZoneScenePoints,
+            Axis firstAxis,
+            Axis secondAxis)
+        {
+            if (markerZoneScenePoints == null || markerZoneScenePoints.Count < 3)
+                return null;
+
+            var projected = new List<SurfacePoint>(markerZoneScenePoints.Count);
+            foreach (var point in markerZoneScenePoints)
+            {
+                projected.Add(new SurfacePoint(
+                    GetAxisValue(point, firstAxis),
+                    GetAxisValue(point, secondAxis)));
+            }
+
+            return GetSurfaceBounds(projected);
+        }
+
+        private static bool SpansArePositive(SurfaceBounds bounds)
+        {
+            return bounds.MaxU - bounds.MinU > MinimumFitBoundsSpanMm &&
+                   bounds.MaxV - bounds.MinV > MinimumFitBoundsSpanMm;
         }
 
         private static SurfacePoint ClampToBounds(SurfacePoint point, SurfaceBounds bounds)
